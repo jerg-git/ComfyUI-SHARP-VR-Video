@@ -2,7 +2,7 @@
 
 Experimental, AI-assisted ComfyUI extension for converting ordinary 2D video frames into full side-by-side stereoscopic frames using Apple SHARP and the gsplat.js renderer. An independent fork of [Well-Made/ComfyUI-SHARP-Gaussian-Stereo](https://github.com/Well-Made/ComfyUI-SHARP-Gaussian-Stereo), focused on batch video and VR experiments. Not affiliated with Apple.
 
-**v0.1.2 release candidate.** Local end-to-end GPU testing is required before publishing. SHARP model use is subject to Apple's research-only license (see below).
+**v0.1.5 test build.** SHARP model use is subject to Apple's research-only license (see below).
 
 ## Features
 
@@ -12,6 +12,31 @@ Experimental, AI-assisted ComfyUI extension for converting ordinary 2D video fra
 - RAM-only intermediate PLY transport, frame-based progress and quiet console logs.
 - Shared browser renderer independent of the active workflow, plus a dedicated renderer page.
 - Retains the interactive single-image preview and optional PLY export.
+
+## v0.1.5 changes
+
+- Bundle the QuietNoise Queue Manager Meta Batch continuation guard directly into the main extension; no extra node or workflow wiring is required.
+- Promote recognized SHARP+VHS Meta Batch continuation chunks ahead of a single prefetched Queue Manager job so longer clips continue cleanly by default.
+- Preserve the v0.1.4 path/meta-batch fixes and the amended sample workflow behavior.
+
+## v0.1.4 changes
+
+- Resolve the literal TextBoxConcatenate path field used in the sample workflow.
+- Track Meta Batch progress from the actual encoder lifetime, including fresh runs with a stale requeue counter. This does not change the VHS queue itself.
+- Preserve the amended sample workflow and preview.
+
+## v0.1.3 highlights
+
+- Consolidates the stable v0.1.2 feature work into a single release build.
+- Includes animated dolly/orbit camera motion, semantic dropdown selectors, optional audio/FPS passthrough, Meta Batch support, Impact Switch source tracing, and the Cross-eyed / Freeview preset.
+- Intended release baseline going forward; future versions should treat the user's latest bundled workflow as the practical source of truth for sample workflow behavior.
+
+## Known issues
+
+- Some **video-without-audio** workflows can still emit harmless warnings from VideoHelperSuite during caching or Meta Batch processing even when SHARP is functioning correctly. This is an upstream VHS lazy-audio issue; final output can still complete successfully.
+- The built-in Queue Manager guard only targets recognized **SHARP VR Video + VHS Meta Batch** continuations under QuietNoise Queue Manager. It does not alter unrelated workflows or other queue implementations.
+- Browser and OS background throttling can still reduce rendering throughput if no visible renderer window remains active.
+- Variable-frame-rate or resampled clips may produce small timing differences for animated camera moves across Meta Batch segments.
 
 ## Installation
 
@@ -31,9 +56,9 @@ A supported CUDA PyTorch setup and a WebGL-enabled browser are required. Install
 
 Connect `SHARP VR Video Model Loader` to `SHARP VR Video Batch`. Connect VHS Load Video's IMAGE output to the batch node's image input, then connect `stereo_frames` to VHS Video Combine. Connect the VHS loader `video_info` to the SHARP batch `video_info` input. Connect SHARP `fps` to Video Combine `frame_rate` and SHARP `audio` to Video Combine `audio`. Leave the VHS loader AUDIO output disconnected. Output frames are `[B,H,2W,3]` (left/right SBS).
 
-A new [batch audio example](workflow/sharp-vr-video-batch-audio.json) starts with a five-frame test cap; select your own input video and set the cap to 0 for the full clip. Start with 3–5 frames. For an approximately 1 m source distance and 1 m VR screen distance, try parallel off-axis, a 60–63 mm baseline, 1.0 m convergence, and depth/splat scales of 1.0. Match focal length to the source when possible. These are approximate starting values, not calibrated viewing guarantees.
+The [sample workflow](workflow/sharp-vr-video-batch-audio-sample.json) supports Upload and Path via a shared Impact Switch selection. The Path field uses RES4LYF TextBoxConcatenate; install both packs to use this sample. Select your own input video and set the cap to 0 for the full clip. Start with 3–5 frames. For an approximately 1 m source distance and 1 m VR screen distance, try parallel off-axis, a 60–63 mm baseline, 1.0 m convergence, and depth/splat scales of 1.0. Match focal length to the source when possible. These are approximate starting values, not calibrated viewing guarantees.
 
-For single images, connect the same model loader to `SHARP VR Video Preview`; see the included [preview example](workflow/gaussian-stereo-workflow.json). The legacy preview screenshot is inherited from the original project.
+For single images, connect the same model loader to `SHARP VR Video Preview`.
 
 **Migrating from previous ZIP builds:** Node IDs and model socket type have changed so the upstream extension can be installed separately. Replace old SHARP nodes in saved workflows, reconnect inputs, and copy settings. Remove the earlier experimental fork from `custom_nodes` (back it up outside that directory first). The model checkpoint can be reused.
 
@@ -93,7 +118,7 @@ The batch renderer now long-polls the Python server (up to 20 seconds per reques
 
 Background optimization v2: normalize the synchronous WASM packing module into a Promise before registering completion callbacks. The packing algorithm is unchanged.
 
-### Batch camera framing (v0.1.2)
+### Batch camera framing (v0.1.x)
 
 The following optional widgets are independent of stereo presets and saved with the workflow. They transform the shared virtual camera before generating the left and right eye poses. They do not alter SHARP inference or the SBS output resolution. New nodes default to the original view. The v0.1.1 widgets retain their original order and new motion widgets are appended, with Fixed as the default. Existing workflows can be opened without intentionally changing their camera offsets; verify settings after upgrading. The interactive single-image preview is unchanged.
 
@@ -105,7 +130,7 @@ The following optional widgets are independent of stereo presets and saved with 
 
 Orbit uses a fixed pivot on the original viewing axis at the convergence distance for fixed stereo modes with finite convergence, otherwise 1 m. Translation is relative to the resulting camera orientation. Fixed convergence remains measured from the final camera; adjust it if necessary after dollying. Reset camera adjustments restores all three neutral values and Fixed motion modes without resetting stereo settings or selected patterns. Fixed mode applies the same offsets to each frame; Animated mode computes new offsets independently for each frame, with no accumulation or bounding-box-driven orbit pivot. Start with 0.02–0.05 m or approximately ±1 degree of orbit; the constrained ranges are intended to keep viewpoint changes modest because larger moves can expose missing geometry and increase flicker. Batch zoom and pan were removed to simplify the controls and avoid unhelpful reframing. Test locally before publishing.
 
-### Animated camera motion (v0.1.2)
+### Animated camera motion (v0.1.x)
 
 Each axis has a **Fixed / Animated** motion selector (Fixed by default). Selecting Animated reveals its pattern selector. Use the existing numeric camera controls as the target values, now in increments of 0.001 m or 0.001 degrees. The dolly range remains 0–0.400 m; each orbit axis remains −10.000 to +10.000 degrees. Camera motion is independent of stereo presets. Fixed mode ignores its pattern.
 
@@ -122,13 +147,19 @@ Each axis has a **Fixed / Animated** motion selector (Fixed by default). Selecti
 
 The three axes can animate independently at the same time. Each leg automatically uses cosine ease-in/out; reversals slow smoothly to a stop. Orbit targets retain their sign: if the target is −5°, −Target is +5°. The first and last frames use the exact endpoints, a two-leg pattern reverses halfway through the batch (between frames if necessary), and a single-frame input uses the first keyframe. Values between keyframes are calculated at floating-point precision, not rounded to the widget step.
 
-Animations span the supplied IMAGE batch, not an externally timed video. If VHS or a workflow splits a clip into multiple batches, the animation restarts on each batch. Use a single batch for one continuous move; two-frame batches cannot depict an intermediate reversal. No changes are made to the inference model, baseline, convergence, output resolution, shared renderer or RAM-only transport. Use small offsets to limit missing-geometry artifacts and test before committing to a long clip.
+Animations span the supplied IMAGE batch by default. For a continuous move across VHS Meta Batch chunks, connect the same manager to SHARP, the selected VHS loader and Video Combine. The intermediate camera timeline is estimated from source metadata and trimming settings; the final chunk uses the actual final frame count. Variable-rate or resampled clips may have small timing differences. No changes are made to the inference model, baseline, convergence, output resolution, shared renderer or RAM-only transport. Use small offsets to limit missing-geometry artifacts and test before committing to a long clip.
 
 
-### Optional audio and FPS (v0.1.2)
+### Optional audio and FPS (v0.1.x)
 
-The batch node accepts optional `video_info` (VHS_VIDEOINFO) and `audio` (AUDIO) inputs and returns `stereo_frames`, `audio`, and `fps`. Connect VHS Load Video (Upload or local Path; including FFmpeg variants) directly via `video_info` to the batch node, and wire the batch outputs into Video Combine. Do not connect VHS's lazy AUDIO output, which can fail upstream for videos with no audio track. Set Video Combine to a video format supporting audio.
+The batch node accepts optional `video_info` (VHS_VIDEOINFO) and `audio` (AUDIO) inputs and returns `stereo_frames`, `audio`, and `fps`. Connect VHS Load Video (Upload or local Path; including FFmpeg variants) directly or through Impact Pack Switch (Any) via `video_info` to the batch node, and wire the batch outputs into Video Combine. Do not connect VHS's lazy AUDIO output, which can fail upstream for videos with no audio track. Set Video Combine to a video format supporting audio.
 
-The batch automatically decodes the first audio stream into 48 kHz stereo float PCM once, using FFmpeg already available to VHS or on PATH, and matches the loaded FPS and selected time window. No audio stream returns `None`; VHS Video Combine can then export video only. Explicit standard AUDIO takes priority. Without video_info, the fallback FPS (default 24) is used; image processing is unchanged. Audio errors are logged and do not abort rendering. Linked filename/timing widgets, URL sources, VHS Meta Batch, mismatched frame counts, and other upstream loader types are not supported for automatic extraction; provide explicit audio instead. Timing assumes the image batch retains the same frame order and temporal sampling as the supplied video_info. Do not route the problematic VHS AUDIO output to the explicit audio input.
+The batch automatically decodes the first audio stream into 48 kHz stereo float PCM once, using FFmpeg already available to VHS or on PATH, and matches the loaded FPS and selected time window. No audio stream returns `None`; VHS Video Combine can then export video only. Explicit standard AUDIO takes priority. Without video_info, the fallback FPS (default 24) is used; image processing is unchanged. Audio errors are logged and do not abort rendering. The sample TextBoxConcatenate path field is supported when it contains literal text with no external input or separator. Other linked filename/timing widgets, URL sources, mismatched frame counts, and other upstream loader types are not supported for automatic extraction; provide explicit audio instead. Timing assumes the image batch retains the same frame order and temporal sampling as the supplied video_info. Do not route the problematic VHS AUDIO output to the explicit audio input.
 
 Semantic selectors use ComfyUI's explicit COMBO format. Actual appearance depends on the frontend version and UI mode.
+
+### Meta Batch and source switching
+
+Connect the same VHS Meta Batch Manager to the active VHS loader, SHARP `meta_batch`, and Video Combine. Use VHS loader format None or AnimateDiff, an unmodified frame sequence, and a video output format. Start at 32 frames per batch. Audio is returned only on the final chunk, covering the entire processed clip; no-audio clips return None. When using Impact Switch (Any), use the selected-value output, select_on_prompt, and identical selection on IMAGE and video_info switches. Literal selections, ImpactInt and supported integer primitives work; arbitrary runtime-computed choices are not resolved. Do not connect VHS AUDIO.
+
+The Cross-eyed / Freeview preset sets Legacy / Toe-in and stereo intensity -45%, with depth and splat scales 1.0. No extra eye-order widget.

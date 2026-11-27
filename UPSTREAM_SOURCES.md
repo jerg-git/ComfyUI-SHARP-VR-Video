@@ -14,3 +14,7 @@ The SHARP checkpoint `sharp_2572gikvuh.pt` is intentionally not included. The lo
 
 ## v0.1.2 packaging note
 This package was rebuilt from the v0.1.1 release as the base, then updated to include the animated camera controls and explicit COMBO/dropdown UI schema changes.
+
+
+## Release packaging note
+Version 0.1.3 was packaged from the latest validated 0.1.2 Meta Batch / switch-support build and documented as the first releasable consolidated version of this fork.

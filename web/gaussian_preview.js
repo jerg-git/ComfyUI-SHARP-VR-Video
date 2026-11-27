@@ -282,6 +282,7 @@ app.registerExtension({
                 // Do not apply during creation/configuration: saved edits must survive reload.
                 const presetValues = {
                     'Legacy / Viewer Controls': [30, 60, 2.5, 'Legacy / Toe-in'],
+                    'Cross-eyed / Freeview': [35, 60, 2.5, 'Legacy / Toe-in', -45],
                     'VR Life-size / Half Body': [35, 60, 2, 'Parallel off-axis'],
                     'VR Life-size / Mixed Shots': [35, 60, 2.5, 'Parallel off-axis'],
                     'VR Life-size / Full Body': [35, 60, 3.5, 'Parallel off-axis'],
@@ -292,10 +293,10 @@ app.registerExtension({
                 const applyPreset = (name) => {
                     const values = presetValues[name];
                     if (!values) return;
-                    const [focal, baseline, convergence, projection] = values;
+                    const [focal, baseline, convergence, projection, intensity = 30] = values;
                     const settings = {focal_length_mm:focal, custom_baseline_mm:baseline,
                         custom_convergence_m:convergence, projection_mode:projection,
-                        stereo_intensity:30, depth_scale:1, splat_size_scale:1};
+                        stereo_intensity:intensity, depth_scale:1, splat_size_scale:1};
                     for (const [key, value] of Object.entries(settings)) {
                         const w = this.widgets?.find(w => w.name === key);
                         if (!w || w.type === 'converted-widget' || w.type === 'hidden' || w.type?.startsWith('converted-widget')) continue;

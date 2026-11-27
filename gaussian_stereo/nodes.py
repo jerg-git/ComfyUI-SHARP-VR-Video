@@ -229,6 +229,7 @@ STEREO_PRESETS = [
     "VR 3D Cinema / Comfortable",
     "VR 3D Cinema / Immersive",
     "Custom / Fixed Stereo",
+    "Cross-eyed / Freeview",
 ]
 PROJECTION_MODES = ["Parallel off-axis", "Parallel", "Toe-in", "Legacy / Parallel", "Legacy / Toe-in"]
 
@@ -342,6 +343,7 @@ class SharpVRVideoBatch(GaussianStereoPreview):
                 "audio": ("AUDIO", {"tooltip": "Optional explicit standard audio override. Do not connect the VHS loader's lazy audio output."}),
                 "fallback_fps": ("FLOAT", {"default":24.0,"min":0.001,"max":240.0,"step":0.001,"round":0.001,
                     "tooltip": "Used when video_info is absent or has no valid loaded FPS."}),
+                "meta_batch": ("VHS_BatchManager", {"tooltip": "Optional: same VHS Meta Batch Manager as loader and combiner; keeps animation continuous and supplies full audio on final chunk."}),
             },
             "hidden": {"unique_id": "UNIQUE_ID", "prompt": "PROMPT"}}
     RETURN_TYPES = ("IMAGE", "AUDIO", "FLOAT")
@@ -363,7 +365,7 @@ class SharpVRVideoBatch(GaussianStereoPreview):
                   camera_dolly_mode="Fixed", camera_dolly_pattern=DEFAULT_CAMERA_PATTERN,
                   camera_orbit_yaw_mode="Fixed", camera_orbit_yaw_pattern=DEFAULT_CAMERA_PATTERN,
                   camera_orbit_pitch_mode="Fixed", camera_orbit_pitch_pattern=DEFAULT_CAMERA_PATTERN,
-                  video_info=None, audio=None, fallback_fps=24.0, prompt=None):
+                  video_info=None, audio=None, fallback_fps=24.0, prompt=None, meta_batch=None):
         import io
         import numpy as np
         import torch
@@ -388,6 +390,37 @@ class SharpVRVideoBatch(GaussianStereoPreview):
             "orbit_pitch_deg": camera_motion_keys(camera_orbit_pitch_mode, camera_orbit_pitch_pattern, ORBIT_MOTION_PATTERNS),
         }
         animated = {key: keys for key, keys in motion.items() if len(keys) > 1}
+        from .video_audio import AudioSourceError, meta_timeline, resolve_video_audio
+        import logging
+        offset, timeline_count, final = 0, count, True
+        timeline_valid = True
+        if meta_batch is not None:
+            try:
+                offset, timeline_count, final = meta_timeline(meta_batch, prompt, unique_id, video_info, count)
+                if video_info is not None and int(video_info["loaded_frame_count"]) != count:
+                    raise AudioSourceError("Image and video_info frame counts differ")
+                logging.getLogger(__name__).info(
+                    "[SHARP VR Video] Meta Batch: frames %d-%d / %d%s; final=%s",
+                    offset + 1, offset + count, timeline_count,
+                    "" if final else " (estimated)", final)
+                # Diagnose direct output wiring without changing VHS state.
+                for downstream in (prompt or {}).values():
+                    inputs = downstream.get("inputs", {})
+                    link = inputs.get("images")
+                    if (downstream.get("class_type") == "VHS_VideoCombine"
+                            and isinstance(link, (list, tuple)) and len(link) == 2
+                            and str(link[0]) == str(unique_id) and link[1] == 0):
+                        manager_link = inputs.get("meta_batch")
+                        if (not isinstance(manager_link, (list, tuple)) or len(manager_link) != 2
+                                or str(manager_link[0]) != str((prompt or {}).get(str(unique_id), {}).get("inputs", {}).get("meta_batch", [None])[0]) or manager_link[1] != 0):
+                            logging.warning("[SHARP VR Video] Video Combine must use the same Meta Batch Manager")
+                        elif offset > 0 and not meta_batch.outputs:
+                            logging.warning("[SHARP VR Video] No existing VHS encoder at a later chunk; check batch wiring and queue settings")
+            except Exception as exc:
+                # Do not restart animation on every chunk: use fixed target instead.
+                logging.warning("[SHARP VR Video] Meta Batch timeline unavailable (%s); using fixed camera targets", str(exc) if isinstance(exc, AudioSourceError) else type(exc).__name__)
+                animated = {}
+                timeline_valid = False
         out = None
         progress = ProgressBar(count)
         with tqdm(total=count, desc="SHARP stereo", unit="frame",
@@ -402,7 +435,7 @@ class SharpVRVideoBatch(GaussianStereoPreview):
                     # the baseline, convergence and every other setting unchanged.
                     frame_stereo = stereo.copy() if animated else stereo
                     for key, keys in animated.items():
-                        frame_stereo[key] = camera_motion_value(stereo[key], keys, i, count)
+                        frame_stereo[key] = camera_motion_value(stereo[key], keys, offset + i, timeline_count)
                     png = capture(ply, ext_data, intr_data, node_id=unique_id,
                                   timeout=int(frame_timeout_seconds), stereo=frame_stereo)
                 finally:
@@ -417,8 +450,13 @@ class SharpVRVideoBatch(GaussianStereoPreview):
                 out[i].copy_(torch.from_numpy(arr))
                 progress.update(1)
                 console_progress.update(1)
-        from .video_audio import resolve_video_audio
-        output_audio, fps = resolve_video_audio(video_info, audio, prompt, unique_id, count, fallback_fps)
+        output_audio, fps = resolve_video_audio(video_info, audio, prompt, unique_id, count, fallback_fps,
+                                                meta_batch, timeline_count if meta_batch is not None and timeline_valid else None)
+        if meta_batch is not None:
+            logging.getLogger(__name__).info(
+                "[SHARP VR Video] Meta Batch output: %d frames, %.6g fps, audio=%s, final=%s",
+                count, fps, "present" if output_audio is not None else "None",
+                bool(meta_batch.has_closed_inputs))
         return (out, output_audio, fps)
 
 
