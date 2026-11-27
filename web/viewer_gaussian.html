@@ -376,7 +376,7 @@
                 // Reapply the user's persisted color after both renderers exist.
                 canvas.style.backgroundColor = currentBackgroundColor;
                 canvasRight.style.backgroundColor = currentBackgroundColor;
-                controls = new SPLAT.OrbitControls(camera, viewerContainer);
+                controls = new SPLAT.OrbitControls(camera, viewerContainer, 0.5, 0.5, 5, !isBatchViewer);
                 // Allow twice as close as before and halve wheel zoom sensitivity.
                 controls.minZoom = 0.05;
                 controls.zoomSpeed = 0.5;
@@ -461,6 +461,39 @@
             syncStereoCameras();
         }
 
+        // Compute a render-only rig from the original camera each time. Never
+        // mutate OrbitControls or accumulate offsets between draws/frames.
+        function batchCameraView(baseCamera, baseTarget, settings) {
+            const view = {position: baseCamera.position, rotation: baseCamera.rotation,
+                fx: baseCamera.data.fx, fy: baseCamera.data.fy, target: baseTarget};
+            if (!settings) return view;
+            const dolly = settings.dolly_m ?? 0;
+            const yaw = settings.orbit_yaw_deg ?? 0, pitch = settings.orbit_pitch_deg ?? 0;
+            if (!dolly && !yaw && !pitch) return view;
+
+            const V = SPLAT.Vector3;
+            const Q = SPLAT.Quaternion;
+            const forward = new V(0, 0, 1);
+            const baseDistance = baseTarget ? baseCamera.position.distanceTo(baseTarget)
+                : Math.max(1, baseCamera.position.magnitude());
+            if (yaw || pitch) {
+                // Fixed pivot, not the per-frame bounding box, to avoid introducing
+                // additional temporal camera motion. Preserve the zero-angle pose.
+                const pivotDistance = settings.mode === 'fixed' && settings.convergence_m > 0
+                    ? settings.convergence_m : 1;
+                const pivot = baseCamera.position.add(baseCamera.rotation.apply(forward).multiply(pivotDistance));
+                const radians = Math.PI / 180;
+                view.rotation = baseCamera.rotation.multiply(Q.FromEuler(new V(pitch * radians, yaw * radians, 0))).normalize();
+                view.position = pivot.subtract(view.rotation.apply(forward).multiply(pivotDistance));
+            }
+            // Move forward along the final viewing axis.
+            view.position = view.position.add(view.rotation.apply(new V(0, 0, dolly)));
+            // Legacy convergence follows the transformed orbit target; fixed modes
+            // instead measure convergence from the final camera position as before.
+            view.target = view.position.add(view.rotation.apply(forward).multiply(Math.max(0.05, baseDistance - dolly)));
+            return view;
+        }
+
         // Synchronize both eye cameras from the shared orbit camera.
         // Parallel preserves orientation; Toe-in aims at a shared convergence point.
         function syncStereoCameras() {
@@ -496,57 +529,60 @@
             }
             if (fixedStereo) stereoValue.textContent = `${(batchStereo.baseline_m * 1000).toFixed(0)} mm`;
 
+            const originalTarget = controls?.getTarget?.() ?? initialCameraData?.target;
+            const view = batchCameraView(camera, originalTarget, isBatchViewer ? batchStereo : null);
+
             if (!isStereoEnabled()) {
                 // Mono uses the master camera pose directly: no stereo offset and
                 // no Toe-in convergence adjustment, preserving the current view axis.
-                cameraLeft.position = camera.position.clone();
-                cameraLeft.rotation = camera.rotation.clone();
-                cameraRight.position = camera.position.clone();
-                cameraRight.rotation = camera.rotation.clone();
+                cameraLeft.position = view.position.clone();
+                cameraLeft.rotation = view.rotation.clone();
+                cameraRight.position = view.position.clone();
+                cameraRight.rotation = view.rotation.clone();
                 for (const eyeCamera of [cameraLeft, cameraRight]) {
-                    eyeCamera.data.fx = camera.data.fx;
-                    eyeCamera.data.fy = camera.data.fy;
+                    eyeCamera.data.fx = view.fx;
+                    eyeCamera.data.fy = view.fy;
                     eyeCamera.data.near = camera.data.near;
                     eyeCamera.data.far = camera.data.far;
                 }
                 return;
             }
 
-            const target = controls?.getTarget?.() ?? initialCameraData?.target;
+            const target = view.target;
             const distance = target
-                ? camera.position.distanceTo(target)
-                : Math.max(1, camera.position.magnitude());
+                ? view.position.distanceTo(target)
+                : Math.max(1, view.position.magnitude());
 
             // Signed baseline: crossing zero makes the two eye cameras pass
             // through one another without swapping panes or canvas assignments.
             const baseline = fixedStereo ? batchStereo.baseline_m : distance * 0.12 * signedIntensity;
-            const worldRight = camera.rotation.apply(new SPLAT.Vector3(1, 0, 0));
+            const worldRight = view.rotation.apply(new SPLAT.Vector3(1, 0, 0));
             const halfOffset = worldRight.multiply(baseline * 0.5);
 
             // Both cameras converge on the orbit target.
-            const convergenceTarget = target ?? camera.position.add(
-                camera.rotation.apply(new SPLAT.Vector3(0, 0, 1)).multiply(distance)
+            const convergenceTarget = target ?? view.position.add(
+                view.rotation.apply(new SPLAT.Vector3(0, 0, 1)).multiply(distance)
             );
 
             const copyPose = (eyeCamera, sign) => {
-                const eyePosition = camera.position.add(halfOffset.multiply(sign));
+                const eyePosition = view.position.add(halfOffset.multiply(sign));
                 eyeCamera.position = eyePosition;
 
                 const fixedToeIn = fixedStereo && batchStereo.projection === 'Toe-in' && batchStereo.convergence_m > 0;
                 if (fixedToeIn || (!fixedStereo && mode === 'toe-in')) {
-                    const toeTarget = fixedToeIn ? camera.position.add(
-                        camera.rotation.apply(new SPLAT.Vector3(0, 0, 1)).multiply(batchStereo.convergence_m)
+                    const toeTarget = fixedToeIn ? view.position.add(
+                        view.rotation.apply(new SPLAT.Vector3(0, 0, 1)).multiply(batchStereo.convergence_m)
                     ) : convergenceTarget;
                     const direction = toeTarget.clone()
                         .subtract(eyePosition)
                         .normalize();
                     eyeCamera.rotation = SPLAT.Quaternion.LookRotation(direction);
                 } else {
-                    eyeCamera.rotation = camera.rotation.clone();
+                    eyeCamera.rotation = view.rotation.clone();
                 }
 
-                eyeCamera.data.fx = camera.data.fx;
-                eyeCamera.data.fy = camera.data.fy;
+                eyeCamera.data.fx = view.fx;
+                eyeCamera.data.fy = view.fy;
                 eyeCamera.data.near = camera.data.near;
                 eyeCamera.data.far = camera.data.far;
                 // At Z=convergence_m the camera translation is canceled by

@@ -2,12 +2,13 @@
 
 Experimental, AI-assisted ComfyUI extension for converting ordinary 2D video frames into full side-by-side stereoscopic frames using Apple SHARP and the gsplat.js renderer. An independent fork of [Well-Made/ComfyUI-SHARP-Gaussian-Stereo](https://github.com/Well-Made/ComfyUI-SHARP-Gaussian-Stereo), focused on batch video and VR experiments. Not affiliated with Apple.
 
-**v0.1.0 release candidate.** Local end-to-end GPU testing is required before publishing. SHARP model use is subject to Apple's research-only license (see below).
+**v0.1.1 release candidate.** Local end-to-end GPU testing is required before publishing. SHARP model use is subject to Apple's research-only license (see below).
 
 ## Features
 
 - IMAGE batch in, full-width SBS IMAGE batch out; compatible with VideoHelperSuite (VHS).
 - Editable one-click stereo presets, fixed baseline, parallel off-axis projection, convergence, focal length, depth and splat scale.
+- Render-only inward dolly and two-axis orbit controls for the entire batch.
 - RAM-only intermediate PLY transport, frame-based progress and quiet console logs.
 - Shared browser renderer independent of the active workflow, plus a dedicated renderer page.
 - Retains the interactive single-image preview and optional PLY export.
@@ -64,6 +65,16 @@ This repository includes the required notices and license texts. It does not cla
 
 Connect VHS Load Video IMAGE to SHARP VR Video Batch, then its stereo_frames IMAGE output to VHS Video Combine. The output is full-width left/right SBS (B,H,2W,3). Keep any ComfyUI browser page or the dedicated SHARP renderer page open; the workflow and node need not be visible.
 
+| stereo_preset | Baseline | Zero-parallax distance |
+|---|---:|---:|
+| Legacy / Viewer Controls | Existing relative intensity | Legacy toe-in |
+| VR Life-size / Half Body | 60 mm | 2 m |
+| VR Life-size / Mixed Shots (default) | 60 mm | 2.5 m |
+| VR Life-size / Full Body | 60 mm | 3.5 m |
+| VR 3D Cinema / Comfortable | 35 mm | 3 m |
+| VR 3D Cinema / Immersive | 50 mm | 3 m |
+| Custom / Fixed Stereo | custom_baseline_mm | custom_convergence_m (0 = infinity) |
+
 Selecting a preset fills the actual node widgets once; edit any value afterward. Reload selected preset reapplies the starting values. The backend never derives render settings from the preset name. Manual values are saved in the workflow. Presets set focal length (35 mm, or 30 mm for Legacy), projection, baseline, convergence, relative intensity (30%), and depth/splat scales (1.0). Custom / Fixed Stereo leaves current values unchanged. Focal length should match the original source lens when known. The original custom_baseline_mm and custom_convergence_m names are retained for workflow compatibility and apply in any relevant projection mode. Parallel off-axis uses baseline and convergence, Parallel uses baseline with zero parallax at infinity, Toe-in rotates toward the specified distance (0 = parallel), and Legacy projection modes use the relative intensity rather than fixed baseline/convergence. The batch always outputs SBS. Workflows from the original fork use different node identifiers. Replace its loader, preview and batch nodes with the corresponding SHARP VR Video nodes, reconnect them, and restore your settings before queueing. The embedded viewer reflects queued settings; edit the node widgets, not the iframe controls.
 
 These are experimental starting values, not guarantees of accurate scale or comfort. SHARP estimates geometry independently per frame. Scale errors, temporal flicker and novel-view artifacts can remain. Use a flat SBS VR player and adjust virtual screen distance/size to match the desired zero-parallax plane and source field of view. Test several seconds including close foreground objects and scene cuts before converting an entire video. GPU/browser end-to-end rendering requires local testing.
@@ -81,3 +92,15 @@ The shared renderer now belongs to the browser document, not to the workflow gra
 The batch renderer now long-polls the Python server (up to 20 seconds per request), and wakes on Gaussian packing/sorting completion events instead of polling WebGL readiness every 40 ms. A watchdog timer and network-error retry remain. Rendering settings, PLY transport and console progress are unchanged. A hidden or minimized browser can still be throttled, frozen or GPU-suspended by the browser or OS; for best performance keep a dedicated renderer window visible.
 
 Background optimization v2: normalize the synchronous WASM packing module into a Promise before registering completion callbacks. The packing algorithm is unchanged.
+
+### Batch camera framing (v0.1.1)
+
+The following optional widgets are independent of stereo presets and saved with the workflow. They transform the shared virtual camera before generating the left and right eye poses. They do not alter SHARP inference or the SBS output resolution. New nodes default to the original view. When upgrading from v0.1.1, recreate the batch node and restore your settings: the removed widgets can shift positional workflow values. The interactive single-image preview is unchanged.
+
+| Widget | Default | Meaning |
+|---|---:|---|
+| `camera_dolly_m` | 0 | Move the camera closer, 0 to 0.4 m, like the preview scroll wheel. |
+| `camera_orbit_yaw_deg` | 0 | Orbit horizontally within a constrained ±10° range; positive looks right. |
+| `camera_orbit_pitch_deg` | 0 | Orbit vertically within a constrained ±10° range; positive looks up. |
+
+Orbit uses a fixed pivot on the original viewing axis at the convergence distance for fixed stereo modes with finite convergence, otherwise 1 m. Translation is relative to the resulting camera orientation. Fixed convergence remains measured from the final camera; adjust it if necessary after dollying. Reset camera adjustments restores all three neutral values without resetting stereo settings. Each frame receives the same offsets, with no accumulation or bounding-box-driven orbit pivot. Start with 0.02–0.05 m or a few degrees; the constrained ranges are intended to keep viewpoint changes modest because larger moves can expose missing geometry and increase flicker. Batch zoom and pan were removed to simplify the controls and avoid unhelpful reframing. Test locally before publishing.

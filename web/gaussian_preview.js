@@ -15,7 +15,7 @@ const EXTENSION_FOLDER = (() => {
 
 console.log("[Gaussian Stereo] Loading extension...");
 
-const workerUrl = `/extensions/${EXTENSION_FOLDER}/viewer_gaussian.html?batch=1&worker=1&v=event-render-2`;
+const workerUrl = `/extensions/${EXTENSION_FOLDER}/viewer_gaussian.html?batch=1&worker=1&v=camera-controls-2`;
 function startSharedRenderer() {
     // This belongs to the document, not to a graph or a DOM widget.
     if (document.getElementById('sharp-vr-video-shared-renderer')) return;
@@ -306,11 +306,22 @@ app.registerExtension({
                 // No node-owned iframe: switching graphs must not destroy the renderer.
                 const reload = this.addWidget('button', 'Reload selected preset', null, () => applyPreset(presetWidget?.value), {serialize:false});
                 if (reload) reload.serialize = false;
+                const resetCamera = this.addWidget('button', 'Reset camera adjustments', null, () => {
+                    const settings = {camera_dolly_m:0, camera_orbit_yaw_deg:0, camera_orbit_pitch_deg:0};
+                    for (const [key, value] of Object.entries(settings)) {
+                        const w = this.widgets?.find(w => w.name === key);
+                        if (!w || w.type === 'hidden' || w.type?.startsWith('converted-widget')) continue;
+                        w.value = value;
+                        w.callback?.call(w, value, app.canvas, this);
+                    }
+                    this.setDirtyCanvas?.(true, true);
+                }, {serialize:false});
+                if (resetCamera) resetCamera.serialize = false;
                 const open = this.addWidget('button', 'Open dedicated SHARP renderer', null, () => {
                     window.open(workerUrl, 'sharp-vr-video-dedicated-renderer', 'noopener');
                 }, {serialize:false});
                 if (open) open.serialize = false;
-                this.setSize([520,400]);
+                this.setSize([520, Math.max(400, this.computeSize?.()[1] ?? 400)]);
                 return r;
             };
         }

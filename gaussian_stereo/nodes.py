@@ -234,7 +234,9 @@ PROJECTION_MODES = ["Parallel off-axis", "Parallel", "Toe-in", "Legacy / Paralle
 
 
 def resolve_stereo_settings(projection_mode, baseline_mm, convergence_m,
-                            stereo_intensity, depth_scale, splat_size_scale):
+                            stereo_intensity, depth_scale, splat_size_scale,
+                            camera_dolly_m=0.0, camera_orbit_yaw_deg=0.0,
+                            camera_orbit_pitch_deg=0.0):
     if projection_mode not in PROJECTION_MODES:
         raise ValueError(f"Unknown stereo projection: {projection_mode}")
     def bounded(value, low, high, name):
@@ -248,7 +250,10 @@ def resolve_stereo_settings(projection_mode, baseline_mm, convergence_m,
             "convergence_m": bounded(convergence_m, 0, 100, "Convergence (m)"),
             "intensity": bounded(stereo_intensity, -100, 100, "Relative intensity (%)"),
             "depth_scale": bounded(depth_scale, 0.1, 3, "Depth scale"),
-            "splat_scale": bounded(splat_size_scale, 0.01, 100, "Splat size scale")}
+            "splat_scale": bounded(splat_size_scale, 0.01, 100, "Splat size scale"),
+            "dolly_m": bounded(camera_dolly_m, 0, 0.4, "Camera dolly (m)"),
+            "orbit_yaw_deg": bounded(camera_orbit_yaw_deg, -10, 10, "Orbit yaw (degrees)"),
+            "orbit_pitch_deg": bounded(camera_orbit_pitch_deg, -10, 10, "Orbit pitch (degrees)")}
 
 
 class SharpVRVideoBatch(GaussianStereoPreview):
@@ -270,6 +275,12 @@ class SharpVRVideoBatch(GaussianStereoPreview):
                     "tooltip": "Relative stereo intensity (percent). Only used in the Legacy projection modes."}),
                 "depth_scale": ("FLOAT", {"default":1.0,"min":0.1,"max":3.0,"step":0.01}),
                 "splat_size_scale": ("FLOAT", {"default":1.0,"min":0.01,"max":100.0,"step":0.01}),
+                "camera_dolly_m": ("FLOAT", {"default":0.0,"min":0.0,"max":0.4,"step":0.01,
+                    "tooltip": "Move both cameras closer in metres (like the preview wheel). 0 = original camera position."}),
+                "camera_orbit_yaw_deg": ("FLOAT", {"default":0.0,"min":-10.0,"max":10.0,"step":0.5,
+                    "tooltip": "Orbit horizontally about the fixed convergence distance (1 m in legacy/infinite modes). Positive looks right."}),
+                "camera_orbit_pitch_deg": ("FLOAT", {"default":0.0,"min":-10.0,"max":10.0,"step":0.5,
+                    "tooltip": "Orbit vertically about the same fixed pivot. Positive looks up."}),
             },
             "hidden": {"unique_id": "UNIQUE_ID"}}
     RETURN_TYPES = ("IMAGE",)
@@ -285,7 +296,9 @@ class SharpVRVideoBatch(GaussianStereoPreview):
                   unique_id=None, stereo_preset="VR Life-size / Mixed Shots",
                   custom_baseline_mm=60.0, custom_convergence_m=2.5,
                   projection_mode="Parallel off-axis", stereo_intensity=30.0,
-                  depth_scale=1.0, splat_size_scale=1.0):
+                  depth_scale=1.0, splat_size_scale=1.0,
+                  camera_dolly_m=0.0, camera_orbit_yaw_deg=0.0,
+                  camera_orbit_pitch_deg=0.0):
         import io
         import numpy as np
         import torch
@@ -301,7 +314,8 @@ class SharpVRVideoBatch(GaussianStereoPreview):
         if unique_id is None:
             raise ValueError("Batch node requires its ComfyUI unique_id")
         stereo = resolve_stereo_settings(projection_mode, custom_baseline_mm, custom_convergence_m,
-                                         stereo_intensity, depth_scale, splat_size_scale)
+                                         stereo_intensity, depth_scale, splat_size_scale,
+                                         camera_dolly_m, camera_orbit_yaw_deg, camera_orbit_pitch_deg)
         count, height, width, _ = image.shape
         out = None
         progress = ProgressBar(count)
