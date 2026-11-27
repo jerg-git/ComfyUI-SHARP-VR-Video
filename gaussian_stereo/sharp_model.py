@@ -227,7 +227,7 @@ class SharpVRVideoLoadModel:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "precision": (["auto", "bf16", "fp16", "fp32"], {
+                "precision": ("COMBO", {"options": ["auto", "bf16", "fp16", "fp32"], 
                     "default": "fp16",
                     "tooltip": "FP16 is the default. You can also select auto, BF16, or FP32.",
                 }),

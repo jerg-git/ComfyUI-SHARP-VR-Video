@@ -267,6 +267,14 @@ app.registerExtension({
         }
 
         if (nodeData.name === "SharpVRVideoBatch") {
+            // Restore conditional visibility after workflow widget values are loaded.
+            const oldConfigure = nodeType.prototype.onConfigure;
+            nodeType.prototype.onConfigure = function() {
+                const result = oldConfigure?.apply(this, arguments);
+                this.refreshSharpMotionWidgets?.();
+                queueMicrotask(() => this.refreshSharpMotionWidgets?.());
+                return result;
+            };
             const oldCreated = nodeType.prototype.onNodeCreated;
             nodeType.prototype.onNodeCreated = function() {
                 const r = oldCreated ? oldCreated.apply(this, arguments) : undefined;
@@ -303,11 +311,65 @@ app.registerExtension({
                         applyPreset(value);
                     };
                 }
+                // Keep widgets registered and serializable even while hidden. This
+                // preserves positional workflow values and standard API inputs.
+                const axes = [
+                    ['camera_dolly_m', 'camera_dolly', 'Dolly'],
+                    ['camera_orbit_yaw_deg', 'camera_orbit_yaw', 'Horizontal orbit'],
+                    ['camera_orbit_pitch_deg', 'camera_orbit_pitch', 'Vertical orbit'],
+                ];
+                const findWidget = name => this.widgets?.find(w => w.name === name);
+                this.refreshSharpMotionWidgets = () => {
+                    for (const [, prefix] of axes) {
+                        const mode = findWidget(prefix + '_mode');
+                        const pattern = findWidget(prefix + '_pattern');
+                        if (!mode || !pattern) continue;
+                        // A connected mode cannot be known until execution; expose
+                        // the pattern so the user can still configure it.
+                        const connected = mode.type?.startsWith('converted-widget') ||
+                            this.inputs?.some(input => input.name === mode.name && input.link != null);
+                        const hidden = !connected && mode.value !== 'Animated';
+                        pattern.hidden = hidden;
+                        if (pattern.options) pattern.options.hidden = hidden;
+                        pattern.syncLiveVisibilityOptions?.();
+                    }
+                    const height = this.computeSize?.()[1];
+                    if (Number.isFinite(height) && this.size && height > this.size[1]) {
+                        this.setSize([this.size[0], height]);
+                    }
+                    this.setDirtyCanvas?.(true, true);
+                };
+                for (const [targetName, prefix, label] of axes) {
+                    const target = findWidget(targetName);
+                    if (target?.options) {
+                        target.options.precision = 3;
+                        target.options.round = 0.001;
+                    }
+                    const mode = findWidget(prefix + '_mode');
+                    const pattern = findWidget(prefix + '_pattern');
+                    if (mode) {
+                        mode.label = label + ' motion';
+                        const originalCallback = mode.callback;
+                        mode.callback = (value, ...args) => {
+                            const result = originalCallback?.call(mode, value, ...args);
+                            this.refreshSharpMotionWidgets();
+                            return result;
+                        };
+                    }
+                    if (pattern) pattern.label = label + ' pattern';
+                }
+                const oldConnectionsChange = this.onConnectionsChange;
+                this.onConnectionsChange = (...args) => {
+                    const result = oldConnectionsChange?.apply(this, args);
+                    this.refreshSharpMotionWidgets();
+                    return result;
+                };
                 // No node-owned iframe: switching graphs must not destroy the renderer.
                 const reload = this.addWidget('button', 'Reload selected preset', null, () => applyPreset(presetWidget?.value), {serialize:false});
                 if (reload) reload.serialize = false;
                 const resetCamera = this.addWidget('button', 'Reset camera adjustments', null, () => {
-                    const settings = {camera_dolly_m:0, camera_orbit_yaw_deg:0, camera_orbit_pitch_deg:0};
+                    const settings = {camera_dolly_m:0, camera_orbit_yaw_deg:0, camera_orbit_pitch_deg:0,
+                        camera_dolly_mode:'Fixed', camera_orbit_yaw_mode:'Fixed', camera_orbit_pitch_mode:'Fixed'};
                     for (const [key, value] of Object.entries(settings)) {
                         const w = this.widgets?.find(w => w.name === key);
                         if (!w || w.type === 'hidden' || w.type?.startsWith('converted-widget')) continue;
@@ -321,6 +383,7 @@ app.registerExtension({
                     window.open(workerUrl, 'sharp-vr-video-dedicated-renderer', 'noopener');
                 }, {serialize:false});
                 if (open) open.serialize = false;
+                this.refreshSharpMotionWidgets();
                 this.setSize([520, Math.max(400, this.computeSize?.()[1] ?? 400)]);
                 return r;
             };

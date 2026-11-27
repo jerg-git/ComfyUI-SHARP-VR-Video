@@ -256,6 +256,53 @@ def resolve_stereo_settings(projection_mode, baseline_mm, convergence_m,
             "orbit_pitch_deg": bounded(camera_orbit_pitch_deg, -10, 10, "Orbit pitch (degrees)")}
 
 
+CAMERA_MOTION_MODES = ["Fixed", "Animated"]
+DOLLY_MOTION_PATTERNS = {
+    "0 → Target": (0, 1),
+    "Target → 0": (1, 0),
+    "0 → Target → 0": (0, 1, 0),
+    "Target → 0 → Target": (1, 0, 1),
+}
+ORBIT_MOTION_PATTERNS = {
+    "0 → Target": (0, 1),
+    "Target → 0": (1, 0),
+    "−Target → Target": (-1, 1),
+    "Target → −Target": (1, -1),
+    "0 → Target → 0": (0, 1, 0),
+    "Target → 0 → Target": (1, 0, 1),
+    "−Target → Target → −Target": (-1, 1, -1),
+    "Target → −Target → Target": (1, -1, 1),
+}
+DEFAULT_CAMERA_PATTERN = "0 → Target"
+
+
+def camera_motion_keys(mode, pattern, patterns):
+    """Validate active motion settings; ignore inactive pattern in Fixed mode."""
+    if mode == "Fixed":
+        return (1,)
+    if mode != "Animated" or pattern not in patterns:
+        raise ValueError(f"Invalid camera motion: {mode!r}, {pattern!r}")
+    return patterns[pattern]
+
+
+def camera_motion_value(target, keys, index, count):
+    """Sample signed keyframes with cosine ease-in/out on each leg.
+
+    The first and last frames are exact endpoints; a one-frame batch uses
+    the first keyframe. Compute from the frame index, never accumulated deltas.
+    """
+    if len(keys) == 1 or count <= 1 or index == 0:
+        return target * keys[0]
+    if index == count - 1:
+        return target * keys[-1]
+    position = index * (len(keys) - 1) / (count - 1)
+    leg = min(int(position), len(keys) - 2)
+    fraction = position - leg
+    eased = (1.0 - math.cos(math.pi * fraction)) * 0.5
+    return target * (keys[leg] + (keys[leg + 1] - keys[leg]) * eased)
+
+
+
 class SharpVRVideoBatch(GaussianStereoPreview):
     """Run SHARP per input frame and capture the original gsplat viewer's stereo canvas."""
     @classmethod
@@ -264,28 +311,42 @@ class SharpVRVideoBatch(GaussianStereoPreview):
             "focal_length_mm": ("FLOAT", {"default":35.0,"min":0.0,"max":500.0,"step":0.1}),
             "frame_timeout_seconds": ("INT", {"default":180,"min":30,"max":900,"step":10})},
             "optional": {
-                "stereo_preset": (STEREO_PRESETS, {"default": "VR Life-size / Mixed Shots",
+                "stereo_preset": ("COMBO", {"options": STEREO_PRESETS, "default": "VR Life-size / Mixed Shots",
                     "tooltip": "Selecting a preset fills the editable widgets once. The actual widget values are used for rendering."}),
                 "custom_baseline_mm": ("FLOAT", {"default":60.0,"min":0.0,"max":100.0,"step":0.1,
                     "tooltip": "Virtual camera separation in millimeters, used in fixed projection modes."}),
                 "custom_convergence_m": ("FLOAT", {"default":2.5,"min":0.0,"max":100.0,"step":0.1,
                     "tooltip": "Zero-parallax distance for off-axis or toe-in projection. 0 means infinity."}),
-                "projection_mode": (PROJECTION_MODES, {"default": "Parallel off-axis"}),
+                "projection_mode": ("COMBO", {"options": PROJECTION_MODES, "default": "Parallel off-axis"}),
                 "stereo_intensity": ("FLOAT", {"default":30.0,"min":-100.0,"max":100.0,"step":1.0,
                     "tooltip": "Relative stereo intensity (percent). Only used in the Legacy projection modes."}),
                 "depth_scale": ("FLOAT", {"default":1.0,"min":0.1,"max":3.0,"step":0.01}),
                 "splat_size_scale": ("FLOAT", {"default":1.0,"min":0.01,"max":100.0,"step":0.01}),
-                "camera_dolly_m": ("FLOAT", {"default":0.0,"min":0.0,"max":0.4,"step":0.01,
+                "camera_dolly_m": ("FLOAT", {"default":0.0,"min":0.0,"max":0.4,"step":0.001,"round":0.001,
                     "tooltip": "Move both cameras closer in metres (like the preview wheel). 0 = original camera position."}),
-                "camera_orbit_yaw_deg": ("FLOAT", {"default":0.0,"min":-10.0,"max":10.0,"step":0.5,
+                "camera_orbit_yaw_deg": ("FLOAT", {"default":0.0,"min":-10.0,"max":10.0,"step":0.001,"round":0.001,
                     "tooltip": "Orbit horizontally about the fixed convergence distance (1 m in legacy/infinite modes). Positive looks right."}),
-                "camera_orbit_pitch_deg": ("FLOAT", {"default":0.0,"min":-10.0,"max":10.0,"step":0.5,
+                "camera_orbit_pitch_deg": ("FLOAT", {"default":0.0,"min":-10.0,"max":10.0,"step":0.001,"round":0.001,
                     "tooltip": "Orbit vertically about the same fixed pivot. Positive looks up."}),
+                # Append new widgets; existing saved widget positions remain unchanged.
+                "camera_dolly_mode": ("COMBO", {"options": CAMERA_MOTION_MODES, "default": "Fixed"}),
+                "camera_dolly_pattern": ("COMBO", {"options": list(DOLLY_MOTION_PATTERNS), "default": DEFAULT_CAMERA_PATTERN,
+                    "tooltip": "Animated dolly across this input batch. Target is camera_dolly_m."}),
+                "camera_orbit_yaw_mode": ("COMBO", {"options": CAMERA_MOTION_MODES, "default": "Fixed"}),
+                "camera_orbit_yaw_pattern": ("COMBO", {"options": list(ORBIT_MOTION_PATTERNS), "default": DEFAULT_CAMERA_PATTERN,
+                    "tooltip": "Animated horizontal orbit. Target retains its sign; −Target negates it."}),
+                "camera_orbit_pitch_mode": ("COMBO", {"options": CAMERA_MOTION_MODES, "default": "Fixed"}),
+                "camera_orbit_pitch_pattern": ("COMBO", {"options": list(ORBIT_MOTION_PATTERNS), "default": DEFAULT_CAMERA_PATTERN,
+                    "tooltip": "Animated vertical orbit. Target retains its sign; −Target negates it."}),
+                "video_info": ("VHS_VIDEOINFO", {"tooltip": "Optional VHS loader video_info. Leave VHS audio disconnected."}),
+                "audio": ("AUDIO", {"tooltip": "Optional explicit standard audio override. Do not connect the VHS loader's lazy audio output."}),
+                "fallback_fps": ("FLOAT", {"default":24.0,"min":0.001,"max":240.0,"step":0.001,"round":0.001,
+                    "tooltip": "Used when video_info is absent or has no valid loaded FPS."}),
             },
-            "hidden": {"unique_id": "UNIQUE_ID"}}
-    RETURN_TYPES = ("IMAGE",)
+            "hidden": {"unique_id": "UNIQUE_ID", "prompt": "PROMPT"}}
+    RETURN_TYPES = ("IMAGE", "AUDIO", "FLOAT")
     OUTPUT_NODE = False
-    RETURN_NAMES = ("stereo_frames",)
+    RETURN_NAMES = ("stereo_frames", "audio", "fps")
     FUNCTION = "run_batch"
     CATEGORY = "utils/preview"
 
@@ -298,7 +359,11 @@ class SharpVRVideoBatch(GaussianStereoPreview):
                   projection_mode="Parallel off-axis", stereo_intensity=30.0,
                   depth_scale=1.0, splat_size_scale=1.0,
                   camera_dolly_m=0.0, camera_orbit_yaw_deg=0.0,
-                  camera_orbit_pitch_deg=0.0):
+                  camera_orbit_pitch_deg=0.0,
+                  camera_dolly_mode="Fixed", camera_dolly_pattern=DEFAULT_CAMERA_PATTERN,
+                  camera_orbit_yaw_mode="Fixed", camera_orbit_yaw_pattern=DEFAULT_CAMERA_PATTERN,
+                  camera_orbit_pitch_mode="Fixed", camera_orbit_pitch_pattern=DEFAULT_CAMERA_PATTERN,
+                  video_info=None, audio=None, fallback_fps=24.0, prompt=None):
         import io
         import numpy as np
         import torch
@@ -317,6 +382,12 @@ class SharpVRVideoBatch(GaussianStereoPreview):
                                          stereo_intensity, depth_scale, splat_size_scale,
                                          camera_dolly_m, camera_orbit_yaw_deg, camera_orbit_pitch_deg)
         count, height, width, _ = image.shape
+        motion = {
+            "dolly_m": camera_motion_keys(camera_dolly_mode, camera_dolly_pattern, DOLLY_MOTION_PATTERNS),
+            "orbit_yaw_deg": camera_motion_keys(camera_orbit_yaw_mode, camera_orbit_yaw_pattern, ORBIT_MOTION_PATTERNS),
+            "orbit_pitch_deg": camera_motion_keys(camera_orbit_pitch_mode, camera_orbit_pitch_pattern, ORBIT_MOTION_PATTERNS),
+        }
+        animated = {key: keys for key, keys in motion.items() if len(keys) > 1}
         out = None
         progress = ProgressBar(count)
         with tqdm(total=count, desc="SHARP stereo", unit="frame",
@@ -327,8 +398,13 @@ class SharpVRVideoBatch(GaussianStereoPreview):
                 ext_data = self._validate_matrix(ext, "extrinsics", 4, 4)
                 intr_data = self._validate_matrix(intr, "intrinsics", 3, 3)
                 try:
+                    # Existing camera renderer consumes these three offsets. Keep
+                    # the baseline, convergence and every other setting unchanged.
+                    frame_stereo = stereo.copy() if animated else stereo
+                    for key, keys in animated.items():
+                        frame_stereo[key] = camera_motion_value(stereo[key], keys, i, count)
                     png = capture(ply, ext_data, intr_data, node_id=unique_id,
-                                  timeout=int(frame_timeout_seconds), stereo=stereo)
+                                  timeout=int(frame_timeout_seconds), stereo=frame_stereo)
                 finally:
                     # Release this frame before running inference on the next one.
                     del ply
@@ -341,7 +417,9 @@ class SharpVRVideoBatch(GaussianStereoPreview):
                 out[i].copy_(torch.from_numpy(arr))
                 progress.update(1)
                 console_progress.update(1)
-        return (out,)
+        from .video_audio import resolve_video_audio
+        output_audio, fps = resolve_video_audio(video_info, audio, prompt, unique_id, count, fallback_fps)
+        return (out, output_audio, fps)
 
 
 from .sharp_model import SharpVRVideoLoadModel

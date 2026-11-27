@@ -10,3 +10,7 @@
 | gsplat renderer bundle | https://github.com/dylanebert/gsplat.js | package `gsplat` 1.2.9 | MIT; copyright Dylan Ebert (2023) |
 
 The SHARP checkpoint `sharp_2572gikvuh.pt` is intentionally not included. The loader retrieves it from `https://huggingface.co/apple/Sharp` or reuses a local copy. Its separate Apple Machine Learning Research Model License is included for reference.
+
+
+## v0.1.2 packaging note
+This package was rebuilt from the v0.1.1 release as the base, then updated to include the animated camera controls and explicit COMBO/dropdown UI schema changes.
