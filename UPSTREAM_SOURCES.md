@@ -18,3 +18,5 @@ This package was rebuilt from the v0.1.1 release as the base, then updated to in
 
 ## Release packaging note
 Version 0.1.3 was packaged from the latest validated 0.1.2 Meta Batch / switch-support build and documented as the first releasable consolidated version of this fork.
+
+- v0.2.0: consolidates single-frame inference and browser overlap, optional CuPy covariance and packed transport kernels, WebGL resource updates and bridge wakeups. Two-frame inference experiment removed. Existing upstream licensing unchanged.

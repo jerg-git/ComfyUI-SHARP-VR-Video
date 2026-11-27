@@ -367,14 +367,16 @@ class SharpVRVideoBatch(GaussianStereoPreview):
                   camera_orbit_pitch_mode="Fixed", camera_orbit_pitch_pattern=DEFAULT_CAMERA_PATTERN,
                   video_info=None, audio=None, fallback_fps=24.0, prompt=None, meta_batch=None):
         import io
+        import time
         import numpy as np
         import torch
         import comfy.model_management
         from comfy.utils import ProgressBar
         from PIL import Image
         from tqdm import tqdm
-        from .sharp_inference import run_sharp_inference
-        from .batch_bridge import capture
+        from .sharp_inference import video_inference_frames, clear_video_batch_cache
+        from .batch_bridge import submit_capture, finish_capture, cancel_capture, packed_browser_available
+        import os
 
         if getattr(image, "ndim", None) != 4 or image.shape[0] < 1 or image.shape[-1] != 3:
             raise ValueError("Expected RGB IMAGE batch [B,H,W,3]")
@@ -422,34 +424,151 @@ class SharpVRVideoBatch(GaussianStereoPreview):
                 animated = {}
                 timeline_valid = False
         out = None
+        totals = dict(reconstruct=0.0, export=0.0, browser=0.0, decode=0.0, total=0.0)
+        reconstruction_stages = dict(input_model=0.0, encode=0.0, decode=0.0, unproject=0.0)
+        reconstruction_samples = 0
+        geometry_stages = dict(unproject_prepare=0.0, unproject_svd=0.0, unproject_post=0.0)
+        geometry_samples = 0
+        browser_stages = dict(load=0.0, ready=0.0, compose=0.0, pixels=0.0)
+        load_samples = 0
+        load_fetch = load_parse = load_total = fast_count = direct_count = shared_count = packed_count = 0.0
+        browser_samples = 0
+        raw_frames = 0
         progress = ProgressBar(count)
-        with tqdm(total=count, desc="SHARP stereo", unit="frame",
-                  dynamic_ncols=True, mininterval=0.1) as console_progress:
-            for i in range(count):
-                comfy.model_management.throw_exception_if_processing_interrupted()
-                ply, ext, intr = run_sharp_inference(model, image[i:i+1], None, focal_length_mm, quiet=True)
-                ext_data = self._validate_matrix(ext, "extrinsics", 4, 4)
-                intr_data = self._validate_matrix(intr, "intrinsics", 3, 3)
-                try:
-                    # Existing camera renderer consumes these three offsets. Keep
-                    # the baseline, convergence and every other setting unchanged.
-                    frame_stereo = stereo.copy() if animated else stereo
-                    for key, keys in animated.items():
-                        frame_stereo[key] = camera_motion_value(stereo[key], keys, offset + i, timeline_count)
-                    png = capture(ply, ext_data, intr_data, node_id=unique_id,
-                                  timeout=int(frame_timeout_seconds), stereo=frame_stereo)
-                finally:
-                    # Release this frame before running inference on the next one.
-                    del ply
-                with Image.open(io.BytesIO(png)) as im:
+        # One browser job in flight; reconstruction stays on ComfyUI's execution
+        # thread. Opt out for low-VRAM systems or serial A/B benchmarking.
+        overlap = os.environ.get("SHARP_VR_SERIAL", "0") != "1"
+        pending = None
+        batch_started = time.perf_counter()
+        wait_total = 0.0
+
+        def collect(ticket, i):
+            nonlocal out, raw_frames, browser_samples, load_samples
+            nonlocal load_fetch, load_parse, load_total, fast_count, direct_count, shared_count, packed_count, wait_total
+            browser_timings = {}
+            waiting = time.perf_counter()
+            captured = finish_capture(ticket, browser_timings)
+            decoded_started = time.perf_counter()
+            wait_total += decoded_started - waiting
+            if isinstance(captured, tuple):
+                raw, w, h = captured
+                if (w, h) != (2 * width, height):
+                    raise ValueError(f"Unexpected RGBA size: {w}x{h}")
+                arr = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 4)[..., :3]
+                raw_frames += 1
+            else:
+                with Image.open(io.BytesIO(captured)) as im:
                     if im.size != (2 * width, height):
                         raise ValueError(f"Expected SBS frame {2 * width}x{height}, got {im.size}")
                     arr = np.asarray(im.convert("RGB"), dtype=np.float32) / 255.0
-                if out is None:
-                    out = torch.empty((count, height, 2 * width, 3), dtype=torch.float32, device="cpu")
+            if all(key in browser_timings for key in browser_stages):
+                browser_samples += 1
+                for key in browser_stages:
+                    browser_stages[key] += browser_timings[key]
+            if all(key in browser_timings for key in ("fetch", "parse", "fast", "load")):
+                load_samples += 1
+                load_fetch += browser_timings["fetch"]
+                load_parse += browser_timings["parse"]
+                load_total += browser_timings["load"]
+                fast_count += browser_timings["fast"]
+                direct_count += browser_timings.get("direct", 0)
+                shared_count += browser_timings.get("shared", 0)
+                packed_count += browser_timings.get("packed", 0)
+            if out is None:
+                out = torch.empty((count, height, 2 * width, 3), dtype=torch.float32, device="cpu")
+            if isinstance(captured, tuple):
+                # Convert directly into the final CPU IMAGE tensor; avoid a
+                # temporary RGB float array and an additional full-frame copy.
+                np.divide(arr, np.float32(255.0), out=out[i].numpy(), dtype=np.float32)
+            else:
                 out[i].copy_(torch.from_numpy(arr))
-                progress.update(1)
-                console_progress.update(1)
+            totals["browser"] += browser_timings["roundtrip"]
+            totals["decode"] += time.perf_counter() - decoded_started
+            progress.update(1)
+            console_progress.update(1)
+
+        with tqdm(total=count, desc="SHARP stereo", unit="frame",
+                  dynamic_ncols=True, mininterval=0.1) as console_progress:
+            try:
+                packed_video = (stereo.get('depth_scale') == 1 and stereo.get('splat_scale') == 1 and packed_browser_available())
+                frames = video_inference_frames(model, image, focal_length_mm, packed_video=packed_video)
+                for i, (ply, ext, intr, timings) in enumerate(frames):
+                    comfy.model_management.throw_exception_if_processing_interrupted()
+                    for key in ("reconstruct", "export"):
+                        totals[key] += timings[key]
+                    if all(key in timings for key in reconstruction_stages):
+                        reconstruction_samples += 1
+                        for key in reconstruction_stages:
+                            reconstruction_stages[key] += timings[key]
+                    if all(key in timings for key in geometry_stages):
+                        geometry_samples += 1
+                        for key in geometry_stages:
+                            geometry_stages[key] += timings[key]
+                    try:
+                        ext_data = self._validate_matrix(ext, "extrinsics", 4, 4)
+                        intr_data = self._validate_matrix(intr, "intrinsics", 3, 3)
+                        frame_stereo = stereo.copy() if animated else stereo
+                        for key, keys in animated.items():
+                            frame_stereo[key] = camera_motion_value(stereo[key], keys, offset + i, timeline_count)
+                        # Consume the preceding frame before dispatching another.
+                        # The image index and its camera parameters never change.
+                        if pending is not None:
+                            collect(pending, i - 1)
+                            pending = None
+                        comfy.model_management.throw_exception_if_processing_interrupted()
+                        pending = submit_capture(ply, ext_data, intr_data, node_id=unique_id,
+                                                 timeout=int(frame_timeout_seconds), stereo=frame_stereo,
+                                                 expected_size=(2 * width, height))
+                    finally:
+                        del ply
+                    if not overlap:
+                        collect(pending, i)
+                        pending = None
+                if pending is not None:
+                    collect(pending, count - 1)
+                    pending = None
+            finally:
+                if pending is not None:
+                    cancel_capture(pending)
+                if 'frames' in locals():
+                    frames.close()
+                try:
+                    clear_video_batch_cache()
+                except Exception:
+                    logging.getLogger(__name__).warning("[SHARP VR Video] Chunk cache cleanup failed", exc_info=True)
+        totals["total"] = time.perf_counter() - batch_started
+        logging.getLogger(__name__).info(
+            "[SHARP VR Video] Pipeline: %s; exposed browser wait=%.3f s/frame (stage times may overlap)",
+            "one-frame lookahead" if overlap else "serial", wait_total / count)
+        logging.getLogger(__name__).info(
+            "[SHARP VR Video] Performance (%d frames, mean seconds/frame): "
+            "reconstruct=%.3f, export+cleanup=%.3f, browser=%.3f, pixels+tensor=%.3f, total=%.3f",
+            count, *(totals[key] / count for key in ("reconstruct", "export", "browser", "decode", "total")))
+        if reconstruction_samples:
+            logging.getLogger(__name__).debug(
+                "[SHARP VR Video] Reconstruction detail (%d frames, mean stage seconds): "
+                "input+model=%.3f, encode=%.3f, decode=%.3f, unproject=%.3f",
+                reconstruction_samples,
+                *(reconstruction_stages[key] / reconstruction_samples for key in reconstruction_stages))
+        if geometry_samples:
+            logging.getLogger(__name__).debug(
+                "[SHARP VR Video] Geometry detail (%d frames, mean stage seconds): "
+                "prepare=%.3f, solve=%.3f, post=%.3f",
+                geometry_samples, *(geometry_stages[key] / geometry_samples for key in geometry_stages))
+        if browser_samples:
+            logging.getLogger(__name__).debug(
+                "[SHARP VR Video] Browser detail (%d profiled frames, raw RGBA=%d/%d, mean seconds/frame): "
+                "load=%.3f, ready=%.3f, compose=%.3f, pixels=%.3f",
+                browser_samples, raw_frames, count,
+                *(browser_stages[key] / browser_samples for key in browser_stages))
+        if load_samples:
+            logging.getLogger(__name__).debug(
+                "[SHARP VR Video] Splat load detail (fast parser=%d/%d, mean seconds/frame): fetch=%.3f, parse+construct=%.3f, setup=%.3f",
+                int(fast_count), load_samples, load_fetch / load_samples, load_parse / load_samples,
+                max(0.0, load_total - load_fetch - load_parse) / load_samples)
+            logging.getLogger(__name__).info(
+                "[SHARP VR Video] Browser fast path: direct decoder=%d/%d, shared stereo packing=%d/%d, packed GPU export=%d/%d",
+                int(direct_count), load_samples, int(shared_count), load_samples, int(packed_count), load_samples)
         output_audio, fps = resolve_video_audio(video_info, audio, prompt, unique_id, count, fallback_fps,
                                                 meta_batch, timeline_count if meta_batch is not None and timeline_valid else None)
         if meta_batch is not None:

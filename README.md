@@ -2,34 +2,36 @@
 
 Experimental, AI-assisted ComfyUI extension for converting ordinary 2D video frames into full side-by-side stereoscopic frames using Apple SHARP and the gsplat.js renderer. An independent fork of [Well-Made/ComfyUI-SHARP-Gaussian-Stereo](https://github.com/Well-Made/ComfyUI-SHARP-Gaussian-Stereo), focused on batch video and VR experiments. Not affiliated with Apple.
 
-**v0.1.5 test build.** SHARP model use is subject to Apple's research-only license (see below).
+**v0.2.0 — Performance update.** SHARP model use is subject to Apple's research-only license (see below).
 
 ## Features
 
 - IMAGE batch in, full-width SBS IMAGE batch out; compatible with VideoHelperSuite (VHS).
 - Editable one-click stereo presets, fixed baseline, parallel off-axis projection, convergence, focal length, depth and splat scale.
 - Render-only inward dolly and two-axis orbit controls, independently fixed or animated over the input batch.
-- RAM-only intermediate PLY transport, frame-based progress and quiet console logs.
+- RAM-only intermediate Gaussian transport (PLY or accelerated packed format), frame-based progress and quiet console logs.
 - Shared browser renderer independent of the active workflow, plus a dedicated renderer page.
 - Retains the interactive single-image preview and optional PLY export.
 
-## v0.1.5 changes
+## What's new in v0.2.0
 
-- Bundle the QuietNoise Queue Manager Meta Batch continuation guard directly into the main extension; no extra node or workflow wiring is required.
-- Promote recognized SHARP+VHS Meta Batch continuation chunks ahead of a single prefetched Queue Manager job so longer clips continue cleanly by default.
-- Preserve the v0.1.4 path/meta-batch fixes and the amended sample workflow behavior.
+A major under-the-hood performance update. Existing v0.1.5 workflows, node settings, camera animation, audio/FPS handling and VHS Meta Batch wiring are unchanged. No new mandatory dependencies.
 
-## v0.1.4 changes
+- Overlapping single-frame SHARP inference with browser rendering, with less redundant feature caching, GPU memory cleanup and image conversion.
+- Faster binary Gaussian loading, shared stereo geometry preparation, reused WebGL resources, event-driven dispatch and raw RGBA capture.
+- Optional CuPy acceleration: a specialized FP32 CUDA covariance solver and a compact GPU-packed transfer format. Both retain automatic reference-path fallbacks when unavailable or rejected by validation.
+- Eight-patch encoder batching by default, with memory-error fallback. Full-frame inference remains single-frame; the unsuccessful two-frame experiment was removed.
 
-- Resolve the literal TextBoxConcatenate path field used in the sample workflow.
-- Track Meta Batch progress from the actual encoder lifetime, including fresh runs with a stale requeue counter. This does not change the VHS queue itself.
-- Preserve the amended sample workflow and preview.
+### Performance on an RTX 5080
 
-## v0.1.3 highlights
+| Build / configuration | Warm processing time per frame |
+|---|---:|
+| v0.1.5 (original baseline, 1400 x 784 input) | 1.850 s |
+| v0.1.16 (optional CUDA solver, 1280 x 720 input) | 0.548 s |
+| v0.1.17 (browser fast path, same 720p clip) | 0.457 s |
+| v0.1.18 (single-frame + packed export, same 720p clip) | 0.430 s |
 
-- Consolidates the stable v0.1.2 feature work into a single release build.
-- Includes animated dolly/orbit camera motion, semantic dropdown selectors, optional audio/FPS passthrough, Meta Batch support, Impact Switch source tracing, and the Cross-eyed / Freeview preset.
-- Intended release baseline going forward; future versions should treat the user's latest bundled workflow as the practical source of truth for sample workflow behavior.
+The final tested configuration processed all 177 frames of a silent 720p clip across 128 + 49 frame Meta Batches. Compared with v0.1.16 on the same clip, the warmed-up final batch was about 27% faster in throughput. The roughly 4.3x comparison with v0.1.5 is illustrative, not a controlled same-resolution benchmark. Results depend on hardware, browser, stereo settings, optional dependencies and input; startup, video loading and encoding overhead are excluded from per-frame timings. The v0.2.0 package consolidates the tested single-frame configuration; broader visual and hardware regression testing remains outstanding. Model weights, inference resolution and Gaussian count are unchanged, but numerical rounding and equivalent covariance eigenbases can produce small rendering differences.
 
 ## Known issues
 
@@ -52,6 +54,53 @@ Experimental, AI-assisted ComfyUI extension for converting ordinary 2D video fra
 
 A supported CUDA PyTorch setup and a WebGL-enabled browser are required. Install [ComfyUI-VideoHelperSuite](https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite) separately for video input/output. FP16 is the default model precision. The shared renderer still needs a browser page open; keep its window visible for best performance.
 
+## Optional: enable faster CUDA processing (NVIDIA GPUs)
+
+**You can skip this entire section.** CuPy is not installed automatically and is not needed for normal operation. Without it, the extension uses PyTorch SVD and the existing PLY transfer path, while retaining the other performance improvements. If CuPy is already working in your ComfyUI environment, you do not need to reinstall it.
+
+### Windows Portable (recommended instructions)
+
+1. Close ComfyUI. Open Command Prompt in your `ComfyUI_windows_portable` folder (the folder containing `python_embeded`). Back up `python_embeded` outside that folder if you want a straightforward rollback.
+2. Check the CUDA version used by your ComfyUI PyTorch installation:
+
+   ```bat
+   python_embeded\python.exe -c "import torch; print(torch.version.cuda)"
+   ```
+
+3. Run **only one** of the following commands, matching the major version printed above:
+
+   **CUDA 12.x** (for example, 12.8):
+
+   ```bat
+   python_embeded\python.exe -m pip install "cupy-cuda12x[ctk]"
+   ```
+
+   **CUDA 13.x** (for example, 13.0):
+
+   ```bat
+   python_embeded\python.exe -m pip install "cupy-cuda13x[ctk]"
+   ```
+
+   If the result is `None`, or another unsupported CUDA version, skip the optional acceleration. Do not install both CuPy variants or the source package `cupy` alongside a wheel. For a cautious install, first add `--dry-run` after `pip install` to inspect proposed changes; skip the installation if it would change core dependencies you need to keep. The `[ctk]` extra supplies CUDA components without requiring a system-wide CUDA Toolkit, but a compatible NVIDIA driver is still required. See the [official CuPy installation guide](https://docs.cupy.dev/en/stable/install.html).
+4. Restart ComfyUI, hard-refresh the browser (Ctrl+F5), and run a short video. No workflow edits or BAT settings are needed.
+
+### Other ComfyUI installations
+
+Use the Python executable/environment that actually launches ComfyUI (activate its virtual environment first, if applicable). Run `python -c "import torch; print(torch.version.cuda)"`, then `python -m pip install "cupy-cuda12x[ctk]"` or `python -m pip install "cupy-cuda13x[ctk]"` as appropriate. Do not install into an unrelated system Python. Existing working CuPy installs can be reused.
+
+### Check that acceleration is working
+
+The console may show `CUDA covariance kernel: Jacobi selected` and `Packed GPU export validated`. Packed transport requires an updated browser worker and neutral depth/splat scales (both 1.0). The first eligible run includes kernel compilation and numerical checks; subsequent frames are faster. If the optional path is missing, fails a recoverable validation/compilation check or is unsuitable, the extension uses its reference path. No need to troubleshoot CuPy just to use the node. Unrecoverable CUDA errors may require restarting ComfyUI.
+
+For troubleshooting, add these optional environment variables before the Python launch command in your Windows BAT file (or export them in your shell before launching):
+
+```bat
+set SHARP_VR_COV_KERNEL=0
+set SHARP_VR_PACKED=0
+```
+
+These disable the optional covariance kernel and packed transfer independently; remove the lines to restore automatic selection. They do not undo pip dependency changes. `SHARP_VR_BROWSER_LEGACY=1` additionally disables the browser fast path. `SHARP_VR_SERIAL=1` disables pipeline overlap for diagnosis. Old `SHARP_VR_FRAME_BATCH` settings are no longer needed or used.
+
 ## Quick start
 
 Connect `SHARP VR Video Model Loader` to `SHARP VR Video Batch`. Connect VHS Load Video's IMAGE output to the batch node's image input, then connect `stereo_frames` to VHS Video Combine. Connect the VHS loader `video_info` to the SHARP batch `video_info` input. Connect SHARP `fps` to Video Combine `frame_rate` and SHARP `audio` to Video Combine `audio`. Leave the VHS loader AUDIO output disconnected. Output frames are `[B,H,2W,3]` (left/right SBS).
@@ -60,7 +109,7 @@ The [sample workflow](workflow/sharp-vr-video-batch-audio-sample.json) supports 
 
 For single images, connect the same model loader to `SHARP VR Video Preview`.
 
-**Migrating from previous ZIP builds:** Node IDs and model socket type have changed so the upstream extension can be installed separately. Replace old SHARP nodes in saved workflows, reconnect inputs, and copy settings. Remove the earlier experimental fork from `custom_nodes` (back it up outside that directory first). The model checkpoint can be reused.
+**Upgrading from v0.1.5:** Replace/update the extension, restart ComfyUI and hard-refresh the browser. Existing workflows and checkpoints can be reused. If migrating from the original upstream or a pre-release fork with different node IDs, replace those old nodes and reconnect their inputs. Keep backups outside `custom_nodes`.
 
 ## Limitations
 
@@ -104,17 +153,17 @@ Selecting a preset fills the actual node widgets once; edit any value afterward.
 
 These are experimental starting values, not guarantees of accurate scale or comfort. SHARP estimates geometry independently per frame. Scale errors, temporal flicker and novel-view artifacts can remain. Use a flat SBS VR player and adjust virtual screen distance/size to match the desired zero-parallax plane and source field of view. Test several seconds including close foreground objects and scene cuts before converting an entire video. GPU/browser end-to-end rendering requires local testing.
 
-### Batch RAM-only PLY transport
+### Batch RAM-only Gaussian transport
 
-The VHS batch node now serializes one frame at a time to binary PLY bytes in RAM and serves those bytes directly to the existing browser renderer via a unique, non-cacheable URL. No temporary PLY files are created by the batch node. The job payload is released on completion, failure, timeout or interruption. The single-image preview retains its normal file output behavior. Rendering settings and Gaussian precision are unchanged. Browser caching is disabled for these temporary payloads, but operating-system paging and other applications can still cause disk activity. Keep a browser renderer page open.
+The VHS batch node serializes one frame at a time to binary PLY or, when optional GPU packing and compatible browser settings permit, a compact packed Gaussian stream in RAM. It serves the bytes directly to the browser renderer via a unique, non-cacheable URL. No temporary PLY files are created by the batch node. The job payload is released on completion, failure, timeout or interruption. The single-image preview retains its normal file output behavior. The existing renderer attribute precision is retained; small numerical differences are possible. Browser caching is disabled for these temporary payloads, but operating-system paging and other applications can still cause disk activity. Keep a browser renderer page open.
 
 ### Workflow-independent batch renderer
 
-The shared renderer now belongs to the browser document, not to the workflow graph. Switching between workflows, panning, collapsing or removing the node from the visible graph no longer tears down the renderer. A shared WebGL worker is started automatically when the ComfyUI frontend initializes. The node no longer contains its own preview iframe; the single-image preview is unchanged. Use the batch node's **Open dedicated SHARP renderer** button to open an independent browser page if you want to close the ComfyUI UI. The server prefers an active standalone renderer for newly queued frames. Open it before queueing, and leave it running if closing the main UI. Its URL is `http://127.0.0.1:8188/extensions/ComfyUI-SHARP-VR-Video/viewer_gaussian.html?batch=1&worker=1` for a default local installation. Keep at least one renderer page running; do not close the browser during a job. Actual browser background/minimized-tab throttling and GPU suspension are browser-dependent. For best reliability keep the dedicated renderer in a visible browser window. If a browser is closed during a claimed frame, that frame may time out; do not reload or close the currently rendering browser mid-job. The worker performs explicit WebGL draws instead of relying on requestAnimationFrame; it does not continuously render while idle. RAM-only PLY transport and existing stereo parameters are unchanged.
+The shared renderer now belongs to the browser document, not to the workflow graph. Switching between workflows, panning, collapsing or removing the node from the visible graph no longer tears down the renderer. A shared WebGL worker is started automatically when the ComfyUI frontend initializes. The node no longer contains its own preview iframe; the single-image preview is unchanged. Use the batch node's **Open dedicated SHARP renderer** button to open an independent browser page if you want to close the ComfyUI UI. The server prefers an active standalone renderer for newly queued frames. Open it before queueing, and leave it running if closing the main UI. Its URL is `http://127.0.0.1:8188/extensions/ComfyUI-SHARP-VR-Video/viewer_gaussian.html?batch=1&worker=1` for a default local installation. Keep at least one renderer page running; do not close the browser during a job. Actual browser background/minimized-tab throttling and GPU suspension are browser-dependent. For best reliability keep the dedicated renderer in a visible browser window. If a browser is closed during a claimed frame, that frame may time out; do not reload or close the currently rendering browser mid-job. The worker performs explicit WebGL draws instead of relying on requestAnimationFrame; it does not continuously render while idle. RAM-only transport and existing stereo parameters are retained.
 
 ### Background-tab scheduling
 
-The batch renderer now long-polls the Python server (up to 20 seconds per request), and wakes on Gaussian packing/sorting completion events instead of polling WebGL readiness every 40 ms. A watchdog timer and network-error retry remain. Rendering settings, PLY transport and console progress are unchanged. A hidden or minimized browser can still be throttled, frozen or GPU-suspended by the browser or OS; for best performance keep a dedicated renderer window visible.
+The batch renderer now long-polls the Python server (up to 20 seconds per request), and wakes on Gaussian packing/sorting completion events instead of polling WebGL readiness every 40 ms. A watchdog timer and network-error retry remain. Rendering settings and console progress are retained. A hidden or minimized browser can still be throttled, frozen or GPU-suspended by the browser or OS; for best performance keep a dedicated renderer window visible.
 
 Background optimization v2: normalize the synchronous WASM packing module into a Promise before registering completion callbacks. The packing algorithm is unchanged.
 

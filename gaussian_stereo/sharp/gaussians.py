@@ -91,14 +91,17 @@ def unproject_gaussians(
     extrinsics: torch.Tensor,
     intrinsics: torch.Tensor,
     image_shape: tuple[int, int],
+    *, dense_postprocess=False, profile=None,
 ) -> Gaussians3D:
     """Unproject Gaussians from NDC space to world coordinates."""
     unprojection_matrix = get_unprojection_matrix(extrinsics, intrinsics, image_shape)
-    gaussians = apply_transform(gaussians_ndc, unprojection_matrix[:3])
+    gaussians = apply_transform(gaussians_ndc, unprojection_matrix[:3],
+                                dense_postprocess=dense_postprocess, profile=profile)
     return gaussians
 
 
-def apply_transform(gaussians: Gaussians3D, transform: torch.Tensor) -> Gaussians3D:
+def apply_transform(gaussians: Gaussians3D, transform: torch.Tensor, *,
+                    dense_postprocess=False, profile=None) -> Gaussians3D:
     """Apply an affine transformation to 3D Gaussians.
 
     Args:
@@ -120,7 +123,8 @@ def apply_transform(gaussians: Gaussians3D, transform: torch.Tensor) -> Gaussian
     covariance_matrices = (
         transform_linear @ covariance_matrices @ transform_linear.transpose(-1, -2)
     )
-    quaternions, singular_values = decompose_covariance_matrices(covariance_matrices)
+    quaternions, singular_values = decompose_covariance_matrices(
+        covariance_matrices, dense_postprocess=dense_postprocess, profile=profile)
 
     return Gaussians3D(
         mean_vectors=mean_vectors,
@@ -133,6 +137,7 @@ def apply_transform(gaussians: Gaussians3D, transform: torch.Tensor) -> Gaussian
 
 def decompose_covariance_matrices(
     covariance_matrices: torch.Tensor,
+    *, dense_postprocess=False, profile=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Decompose 3D covariance matrices into quaternions and singular values.
 
@@ -154,15 +159,32 @@ def decompose_covariance_matrices(
     else:
         covariance_matrices = covariance_matrices.detach().float()
 
-    rotations, singular_values_2, _ = torch.linalg.svd(covariance_matrices)
+    if profile is not None:
+        profile.mark("unproject_prepare")
+    if dense_postprocess and device.type == "cuda":
+        from .covariance_kernel import solve
+        rotations, singular_values_2 = solve(covariance_matrices)
+    else:
+        rotations, singular_values_2, _ = torch.linalg.svd(covariance_matrices)
+    if profile is not None:
+        profile.mark("unproject_svd")
 
-    # Vectorized reflection fix — ensure proper rotations (det > 0)
-    dets = torch.linalg.det(rotations)
-    mask = dets < 0
-    if mask.any():
-        rotations[mask, :, -1] *= -1
-
-    quaternions = linalg.quaternions_from_rotation_matrices(rotations)
+    if dense_postprocess:
+        # SVD returns orthogonal 3x3 matrices, so their determinants are near
+        # +/-1. A scalar triple product determines the sign without LU or
+        # dynamic indexing. The first two columns remain exactly unchanged.
+        a, b, c = rotations.unbind(dim=-1)
+        dets = (torch.cross(a, b, dim=-1) * c).sum(dim=-1)
+        c = torch.where((dets < 0)[..., None], -c, c)
+        rotations = torch.stack((a, b, c), dim=-1)
+        quaternions = linalg.quaternions_from_rotation_matrices_dense(rotations)
+    else:
+        # Original preview / reference path.
+        dets = torch.linalg.det(rotations)
+        mask = dets < 0
+        if mask.any():
+            rotations[mask, :, -1] *= -1
+        quaternions = linalg.quaternions_from_rotation_matrices(rotations)
     quaternions = quaternions.to(dtype=dtype, device=device)
     singular_values = singular_values_2.sqrt().to(dtype=dtype, device=device)
     return quaternions, singular_values
@@ -345,7 +367,8 @@ def load_ply(path: Path) -> tuple[Gaussians3D, SceneMetaData]:
 
 @torch.no_grad()
 def save_ply(
-    gaussians: Gaussians3D, f_px: float, image_shape: tuple[int, int], path: Path | None
+    gaussians: Gaussians3D, f_px: float, image_shape: tuple[int, int], path: Path | None,
+    *, include_disparity_range: bool = True, packed_video: bool = False,
 ) -> tuple[bytes | None, dict]:
     """Serialize a predicted Gaussian3D as binary PLY (RAM if path is None).
 
@@ -408,10 +431,15 @@ def save_ply(
         header += f"property float {name}\n"
     header += "end_header\n"
 
-    data = attributes.detach().cpu().to(torch.float32).contiguous().numpy()
     payload = None
+    if packed_video and path is None:
+        from .packed_export import try_pack
+        payload = try_pack(attributes)
+    if payload is None:
+        data = attributes.detach().cpu().to(torch.float32).contiguous().numpy()
     if path is None:
-        payload = header.encode("ascii") + data.tobytes()
+        if payload is None:
+            payload = header.encode("ascii") + data.tobytes()
     else:
         with open(path, "wb") as f:
             f.write(header.encode("ascii"))
@@ -419,15 +447,6 @@ def save_ply(
 
     # Build metadata dictionary
     image_height, image_width = image_shape
-
-    # Calculate disparity quantiles
-    disparity = 1.0 / gaussians.mean_vectors[0, ..., -1]
-    quantiles = (
-        torch.quantile(disparity, q=torch.tensor([0.1, 0.9], device=disparity.device))
-        .float()
-        .cpu()
-        .numpy()
-    )
 
     # Build intrinsic matrix
     intrinsic = [
@@ -443,9 +462,19 @@ def save_ply(
         "focal_length_px": f_px,
         "intrinsic": intrinsic,
         "extrinsic": [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
-        "disparity_range": [float(quantiles[0]), float(quantiles[1])],
         "color_space": "sRGB",
         "version": [1, 5, 0],
     }
+
+    if include_disparity_range:
+        # Calculate disparity quantiles
+        disparity = 1.0 / gaussians.mean_vectors[0, ..., -1]
+        quantiles = (
+            torch.quantile(disparity, q=torch.tensor([0.1, 0.9], device=disparity.device))
+            .float()
+            .cpu()
+            .numpy()
+        )
+        metadata["disparity_range"] = [float(quantiles[0]), float(quantiles[1])]
 
     return payload, metadata

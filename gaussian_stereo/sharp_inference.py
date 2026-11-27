@@ -7,6 +7,7 @@ not used here.
 
 import hashlib
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -15,7 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from .sharp.gaussians import save_ply, unproject_gaussians
-from .sharp.model import MonodepthOutput
+from .sharp.model import MonodepthOutput, video_patch_batching
 from .sharp_model import _load_sharp_model
 from .utils.image import convert_focallength
 
@@ -38,7 +39,46 @@ def _monodepth_to(output, device):
     )
 
 
-def _predict_image_cached(patcher, image_np, f_px, device, extrinsics=None, intrinsics=None, *, quiet=False):
+def _reuse_cuda_cache(device):
+    return torch.device(device).type == "cuda" and os.environ.get("SHARP_VR_FRAME_CACHE_CLEAR", "0") != "1"
+
+
+def clear_video_batch_cache():
+    """Return unused CUDA allocations at the chunk boundary, not each frame."""
+    import comfy.model_management
+    if _reuse_cuda_cache(comfy.model_management.get_torch_device()):
+        comfy.model_management.soft_empty_cache()
+
+
+class _ReconstructionProfile:
+    """CUDA stream spans, without synchronizing between model stages."""
+    def __init__(self, device):
+        self.device = torch.device(device)
+        self.cuda = self.device.type == "cuda"
+        self.marks = []
+        self.mark("start")
+
+    def mark(self, name):
+        if self.cuda:
+            stamp = torch.cuda.Event(enable_timing=True)
+            stamp.record(torch.cuda.current_stream(self.device))
+        else:
+            stamp = time.perf_counter()
+        self.marks.append((name, stamp))
+
+    def finish(self):
+        if self.cuda:
+            self.marks[-1][1].synchronize()
+        result = {}
+        for (_, a), (name, b) in zip(self.marks, self.marks[1:]):
+            result[name] = a.elapsed_time(b) / 1000.0 if self.cuda else b - a
+        if all(key in result for key in ("unproject_prepare", "unproject_svd", "unproject")):
+            result["unproject_post"] = result["unproject"]
+            result["unproject"] += result["unproject_prepare"] + result["unproject_svd"]
+        return result
+
+
+def _predict_image_cached(patcher, image_np, f_px, device, extrinsics=None, intrinsics=None, *, quiet=False, cache_features=True, profile=None):
     import comfy.model_management
 
     report = log.debug if quiet else log.info
@@ -47,15 +87,16 @@ def _predict_image_cached(patcher, image_np, f_px, device, extrinsics=None, intr
     comfy.model_management.load_models_gpu([patcher], memory_required=memory_required)
     predictor = patcher.model
     height, width = image_np.shape[:2]
-    image_hash = hashlib.sha256(image_np.tobytes()).hexdigest()[:16]
+    image_hash = hashlib.sha256(image_np.tobytes()).hexdigest()[:16] if cache_features else None
     patcher_id = id(patcher)
 
-    if (_encode_cache["image_hash"] == image_hash
+    if (cache_features and _encode_cache["image_hash"] == image_hash
             and _encode_cache["patcher_id"] == patcher_id):
         monodepth_output = _monodepth_to(_encode_cache["monodepth_output"], device)
         image_resized = _encode_cache["image_resized"].to(device)
     else:
-        _encode_cache.update(image_hash=None, monodepth_output=None, image_resized=None, patcher_id=None)
+        if cache_features:
+            _encode_cache.update(image_hash=None, monodepth_output=None, image_resized=None, patcher_id=None)
         # Match the neural-network input to the actual loaded parameter dtype.
         # Keep image normalization and resizing in FP32, then cast once at the
         # model boundary to avoid manual_cast promoting the ViT layers back to FP32.
@@ -69,19 +110,27 @@ def _predict_image_cached(patcher, image_np, f_px, device, extrinsics=None, intr
             image_tensor[None], size=internal_shape, mode="bilinear", align_corners=True
         ).to(dtype=model_dtype)
         started = time.time()
-        monodepth_output, _ = predictor.encode(image_resized)
+        if profile is not None:
+            profile.mark("input_model")
+        with video_patch_batching(not cache_features and torch.device(device).type == "cuda"):
+            monodepth_output, _ = predictor.encode(image_resized)
+        if profile is not None:
+            profile.mark("encode")
         report("SHARP encode completed in %.2fs", time.time() - started)
-        _encode_cache["image_hash"] = image_hash
-        _encode_cache["patcher_id"] = patcher_id
-        _encode_cache["monodepth_output"] = _monodepth_to(monodepth_output, "cpu")
-        _encode_cache["image_resized"] = image_resized.cpu()
-        comfy.model_management.soft_empty_cache()
+        if cache_features:
+            _encode_cache["image_hash"] = image_hash
+            _encode_cache["patcher_id"] = patcher_id
+            _encode_cache["monodepth_output"] = _monodepth_to(monodepth_output, "cpu")
+            _encode_cache["image_resized"] = image_resized.cpu()
+            comfy.model_management.soft_empty_cache()
 
     disparity_factor = torch.tensor(
         [f_px / width], dtype=image_resized.dtype, device=device
     )
     started = time.time()
     gaussians_ndc = predictor.decode(monodepth_output, image_resized, disparity_factor)
+    if profile is not None:
+        profile.mark("decode")
     report("SHARP decode completed in %.2fs", time.time() - started)
 
     if intrinsics is not None:
@@ -96,14 +145,20 @@ def _predict_image_cached(patcher, image_np, f_px, device, extrinsics=None, intr
     intrinsics_resized[0] *= internal_shape[0] / width
     intrinsics_resized[1] *= internal_shape[1] / height
     unproj_extrinsics = extrinsics if extrinsics is not None else torch.eye(4, device=device)
-    return unproject_gaussians(
-        gaussians_ndc, unproj_extrinsics, intrinsics_resized, internal_shape
+    gaussians = unproject_gaussians(
+        gaussians_ndc, unproj_extrinsics, intrinsics_resized, internal_shape,
+        dense_postprocess=(not cache_features and torch.device(device).type == "cuda"
+                           and os.environ.get("SHARP_VR_LEGACY_DECOMP", "0") != "1"),
+        profile=profile,
     )
+    if profile is not None:
+        profile.mark("unproject")
+    return gaussians
 
 
 @torch.no_grad()
 def run_sharp_inference(model_config, image, output_dir, focal_length_mm=30.0,
-                        extrinsics=None, intrinsics=None, *, quiet=False):
+                        extrinsics=None, intrinsics=None, *, quiet=False, video_batch=False, timings=None, packed_video=False):
     import comfy.model_management
 
     if not isinstance(model_config, dict):
@@ -111,8 +166,10 @@ def run_sharp_inference(model_config, image, output_dir, focal_length_mm=30.0,
     if image.dim() != 4 or image.shape[0] != 1:
         raise ValueError("SHARP VR Video Preview expects one IMAGE with shape [1,H,W,C].")
 
+    started = time.perf_counter()
     patcher = _load_sharp_model(model_config)
     device = patcher.load_device
+    profile = _ReconstructionProfile(device) if video_batch and timings is not None else None
     image_np = (image[0].detach().cpu().numpy() * 255.0).astype(np.uint8)
     height, width = image_np.shape[:2]
     use_camera = extrinsics is not None and intrinsics is not None
@@ -150,18 +207,41 @@ def run_sharp_inference(model_config, image, output_dir, focal_length_mm=30.0,
     gaussians = _predict_image_cached(
         patcher, image_np, f_px, device,
         extrinsics=img_extrinsics, intrinsics=img_intrinsics, quiet=quiet,
+        cache_features=not video_batch, profile=profile,
     )
 
+    reconstructed = time.perf_counter()
     # Batch rendering requests an in-memory PLY; single-image previews retain file export.
     output_path = None
     if output_dir is not None:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         output_path = Path(output_dir) / f"sharp_vr_video_{int(time.time() * 1000)}.ply"
-    payload, metadata = save_ply(gaussians, f_px, (height, width), output_path)
+    payload, metadata = save_ply(gaussians, f_px, (height, width), output_path,
+                                 include_disparity_range=not video_batch, packed_video=packed_video)
     if output_path is None:
         report("SHARP PLY in RAM: %.1f MiB (%s gaussians)", len(payload) / 1048576,
                  f"{metadata['num_gaussians']:,}")
     else:
         report("Saved SHARP PLY: %s (%s gaussians)", output_path, f"{metadata['num_gaussians']:,}")
-    comfy.model_management.soft_empty_cache()
+    if not video_batch or not _reuse_cuda_cache(device):
+        comfy.model_management.soft_empty_cache()
+    if timings is not None:
+        timings["reconstruct"] = reconstructed - started
+        if profile is not None:
+            timings.update(profile.finish())
+        timings["export"] = time.perf_counter() - reconstructed
     return (payload if output_path is None else str(output_path)), metadata["extrinsic"], metadata["intrinsic"]
+
+
+
+def video_inference_frames(model_config, image, focal_length_mm, *, packed_video=False):
+    """Yield each frame in order, with bounded single-frame inference."""
+    import comfy.model_management as mm
+    for index in range(len(image)):
+        mm.throw_exception_if_processing_interrupted()
+        timings = {}
+        ply, ext, intr = run_sharp_inference(
+            model_config, image[index:index+1], None, focal_length_mm,
+            quiet=True, video_batch=True, timings=timings, packed_video=packed_video)
+        yield ply, ext, intr, timings
+        del ply

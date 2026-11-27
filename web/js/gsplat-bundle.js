@@ -543,7 +543,7 @@ var GSPLAT = (() => {
       };
     }
     static Deserialize(t) {
-      const n = t.length / _Y.RowLength, i = new Float32Array(3 * n), e = new Float32Array(4 * n), A = new Float32Array(3 * n), o = new Uint8Array(4 * n), s = new Float32Array(t.buffer), r = new Uint8Array(t.buffer);
+      const n = t.length / _Y.RowLength, i = new Float32Array(3 * n), e = new Float32Array(4 * n), A = new Float32Array(3 * n), o = new Uint8Array(4 * n), s = new Float32Array(t.buffer,t.byteOffset,t.byteLength/4), r = t;
       for (let Q = 0; Q < n; Q++)
         i[3 * Q + 0] = s[8 * Q + 0], i[3 * Q + 1] = s[8 * Q + 1], i[3 * Q + 2] = s[8 * Q + 2], e[4 * Q + 0] = (r[32 * Q + 28 + 0] - 128) / 128, e[4 * Q + 1] = (r[32 * Q + 28 + 1] - 128) / 128, e[4 * Q + 2] = (r[32 * Q + 28 + 2] - 128) / 128, e[4 * Q + 3] = (r[32 * Q + 28 + 3] - 128) / 128, A[3 * Q + 0] = s[8 * Q + 3 + 0], A[3 * Q + 1] = s[8 * Q + 3 + 1], A[3 * Q + 2] = s[8 * Q + 3 + 2], o[4 * Q + 0] = r[32 * Q + 24 + 0], o[4 * Q + 1] = r[32 * Q + 24 + 1], o[4 * Q + 2] = r[32 * Q + 24 + 2], o[4 * Q + 3] = r[32 * Q + 24 + 3];
       return new _Y(n, i, e, A, o);
@@ -667,7 +667,7 @@ format binary_little_endian 1.0
     }
   };
   var X = class _X extends st {
-    constructor(t = void 0) {
+    constructor(t = void 0, sharpBounds = null) {
       super(), this.selectedChanged = false, this.colorTransformChanged = false, this._selected = false, this._colorTransforms = [], this._colorTransformsMap = /* @__PURE__ */ new Map(), this._data = t || new Y(), this._bounds = new nt(
         new R(1 / 0, 1 / 0, 1 / 0),
         new R(-1 / 0, -1 / 0, -1 / 0)
@@ -690,7 +690,24 @@ format binary_little_endian 1.0
         this.data.rotate(this.rotation), this.rotation = new y();
       }, this.applyScale = () => {
         this.data.scale(this.scale), this.scale = new R(1, 1, 1);
-      }, this.recalculateBounds();
+      };
+      if (sharpBounds === true) {
+        const p = this._data.positions;
+        let x0=Infinity,y0=Infinity,z0=Infinity,x1=-Infinity,y1=-Infinity,z1=-Infinity;
+        for (let j=0;j<p.length;j+=3) {
+          x0=Math.min(x0,p[j]); y0=Math.min(y0,p[j+1]); z0=Math.min(z0,p[j+2]);
+          x1=Math.max(x1,p[j]); y1=Math.max(y1,p[j+1]); z1=Math.max(z1,p[j+2]);
+        }
+        this._bounds=new nt(new R(x0,y0,z0),new R(x1,y1,z1));
+      } else if (sharpBounds) {
+        this._bounds=new nt(sharpBounds.min.clone(),sharpBounds.max.clone());
+      } else this.recalculateBounds();
+    }
+    // Only for a newly decoded, unadjusted batch splat; data remains independent.
+    cloneSharpBatch() {
+      const t = new _X(this.data.clone(), this._bounds);
+      t.position=this.position.clone(); t.rotation=this.rotation.clone(); t.scale=this.scale.clone();
+      return t;
     }
     saveToFile(t = null, n = "splat") {
       if (!document) return;
@@ -926,6 +943,14 @@ format binary_little_endian 1.0
           this.removeObject(n);
       }, this.reset();
     }
+    replaceSharpBatchObject(t) {
+      this._sharpBatchFast = true;
+      this._sharpReplacing = true;
+      try {
+        for (const old of this.objects.slice()) this.removeObject(old);
+      } finally { this._sharpReplacing = false; }
+      this.addObject(t);
+    }
     getMergedSceneDataBuffer(t = "splat") {
       const n = [];
       let i = 0;
@@ -1028,6 +1053,104 @@ format binary_little_endian 1.0
     static LoadFromArrayBuffer(t, n, i = "") {
       const e = new Uint8Array(this._ParsePLYBuffer(t, i)), A = Y.Deserialize(e), o = new X(A);
       return n.addObject(o), o;
+    }
+    // Batch-only specialization for SHARP's exact fixed 14-float export.
+    // Retain the legacy packed representation, Float32 rounding and clamped
+    // 8-bit color/quaternion rounding, including normalization order.
+    static _ParseSharpBatchBuffer(buffer) {
+      const bytes = new Uint8Array(buffer);
+      const header = new TextDecoder().decode(bytes.subarray(0, 1024));
+      const match = /^ply\nformat binary_little_endian 1\.0\nelement vertex (\d+)\n/.exec(header);
+      if (!match) return null;
+      const count = Number(match[1]);
+      const names = ['x','y','z','f_dc_0','f_dc_1','f_dc_2','opacity','scale_0','scale_1','scale_2','rot_0','rot_1','rot_2','rot_3'];
+      const expected = match[0] + names.map(name => 'property float '+name+'\n').join('') + 'end_header\n';
+      if (!header.startsWith(expected) || !Number.isSafeInteger(count) || count <= 0 ||
+          buffer.byteLength !== expected.length + count * 56) return null;
+      const input = new DataView(buffer, expected.length);
+      const packed = new ArrayBuffer(count * Y.RowLength);
+      const floats = new Float32Array(packed);
+      const rgba = new Uint8ClampedArray(packed);
+      for (let row=0, src=0, dst=0, b=0; row<count; row++, src+=56, dst+=8, b+=32) {
+        floats[dst] = input.getFloat32(src,true);
+        floats[dst+1] = input.getFloat32(src+4,true);
+        floats[dst+2] = input.getFloat32(src+8,true);
+        rgba[b+24] = (0.5 + et.SH_C0 * input.getFloat32(src+12,true))*255;
+        rgba[b+25] = (0.5 + et.SH_C0 * input.getFloat32(src+16,true))*255;
+        rgba[b+26] = (0.5 + et.SH_C0 * input.getFloat32(src+20,true))*255;
+        rgba[b+27] = 1/(1+Math.exp(-input.getFloat32(src+24,true)))*255;
+        floats[dst+3] = Math.exp(input.getFloat32(src+28,true));
+        floats[dst+4] = Math.exp(input.getFloat32(src+32,true));
+        floats[dst+5] = Math.exp(input.getFloat32(src+36,true));
+        const w=input.getFloat32(src+40,true), x=input.getFloat32(src+44,true),
+              yq=input.getFloat32(src+48,true), z=input.getFloat32(src+52,true);
+        const norm=Math.sqrt(x*x+yq*yq+z*z+w*w);
+        rgba[b+28] = (w/norm)*128+128;
+        rgba[b+29] = (x/norm)*128+128;
+        rgba[b+30] = (yq/norm)*128+128;
+        rgba[b+31] = (z/norm)*128+128;
+      }
+      return packed;
+    }
+    static get SupportsSharpPacked() { return true; }
+    static _DecodeSharpBatchData(buffer) {
+      if (buffer.byteLength > 8 && new TextDecoder().decode(new Uint8Array(buffer,0,8)) === 'SVRPACK1') {
+        if ((buffer.byteLength-8)%32 !== 0) throw new Error('Invalid SHARP packed payload');
+        return Y.Deserialize(new Uint8Array(buffer,8));
+      }
+      const bytes=new Uint8Array(buffer);
+      const header=new TextDecoder().decode(bytes.subarray(0,1024));
+      const match=/^ply\nformat binary_little_endian 1\.0\nelement vertex (\d+)\n/.exec(header);
+      if (!match) return null;
+      const count=Number(match[1]);
+      const names=['x','y','z','f_dc_0','f_dc_1','f_dc_2','opacity','scale_0','scale_1','scale_2','rot_0','rot_1','rot_2','rot_3'];
+      const expected=match[0]+names.map(name=>'property float '+name+'\n').join('')+'end_header\n';
+      if (!header.startsWith(expected) || !Number.isSafeInteger(count) || count<=0 || buffer.byteLength!==expected.length+count*56) return null;
+      const input=new DataView(buffer,expected.length), positions=new Float32Array(count*3),
+            scales=new Float32Array(count*3), rotations=new Float32Array(count*4), colors=new Uint8ClampedArray(count*4), q=new Uint8ClampedArray(4);
+      for(let row=0,src=0,j=0,k=0;row<count;row++,src+=56,j+=3,k+=4) {
+        positions[j]=input.getFloat32(src,true); positions[j+1]=input.getFloat32(src+4,true); positions[j+2]=input.getFloat32(src+8,true);
+        colors[k]=(0.5+et.SH_C0*input.getFloat32(src+12,true))*255;
+        colors[k+1]=(0.5+et.SH_C0*input.getFloat32(src+16,true))*255;
+        colors[k+2]=(0.5+et.SH_C0*input.getFloat32(src+20,true))*255;
+        colors[k+3]=1/(1+Math.exp(-input.getFloat32(src+24,true)))*255;
+        scales[j]=Math.exp(input.getFloat32(src+28,true)); scales[j+1]=Math.exp(input.getFloat32(src+32,true)); scales[j+2]=Math.exp(input.getFloat32(src+36,true));
+        const w=input.getFloat32(src+40,true),x=input.getFloat32(src+44,true),yq=input.getFloat32(src+48,true),z=input.getFloat32(src+52,true);
+        const norm=Math.sqrt(x*x+yq*yq+z*z+w*w);
+        q[0]=(w/norm)*128+128; q[1]=(x/norm)*128+128; q[2]=(yq/norm)*128+128; q[3]=(z/norm)*128+128;
+        rotations[k]=(q[0]-128)/128; rotations[k+1]=(q[1]-128)/128; rotations[k+2]=(q[2]-128)/128; rotations[k+3]=(q[3]-128)/128;
+      }
+      return new Y(count,positions,rotations,scales,new Uint8Array(colors.buffer));
+    }
+    static async LoadSharpBatchPairAsync(url, detail) {
+      const start=performance.now(), response=await rt(url,false), buffer=await response.arrayBuffer();
+      const parseStart=performance.now(), data=this._DecodeSharpBatchData(buffer);
+      if (!data) {
+        // Unknown format: use original decoder and independent construction.
+        const scratch=new kt();
+        const left=this.LoadFromArrayBuffer(buffer,scratch);
+        detail.fetch=(parseStart-start)/1000; detail.parse=(performance.now()-parseStart)/1000; detail.fast=0; detail.direct=0;
+        return {left,right:left.clone(),shared:false};
+      }
+      const left=new X(data,true), right=left.cloneSharpBatch();
+      const pair={packed:null};
+      left._sharpPackPair=right._sharpPackPair=pair;
+      detail.fetch=(parseStart-start)/1000; detail.parse=(performance.now()-parseStart)/1000; detail.fast=1; detail.direct=1; detail.packed=new TextDecoder().decode(new Uint8Array(buffer,0,8))==='SVRPACK1'?1:0;
+      return {left,right,shared:true};
+    }
+    static async LoadSharpBatchAsync(url, scene, detail) {
+      const start=performance.now();
+      const response=await rt(url,false), bytes=await At(response);
+      const parseStart=performance.now();
+      const packed=this._ParseSharpBatchBuffer(bytes.buffer);
+      const splat = packed === null
+        ? this.LoadFromArrayBuffer(bytes.buffer,scene)
+        : new X(Y.Deserialize(new Uint8Array(packed)));
+      if (packed !== null) scene.addObject(splat);
+      detail.fetch=(parseStart-start)/1000;
+      detail.parse=(performance.now()-parseStart)/1000;
+      detail.fast=packed === null ? 0 : 1;
+      return splat;
     }
     static _ParsePLYBuffer(t, n) {
       const i = new Uint8Array(t), e = new TextDecoder().decode(i.slice(0, 1024 * 10)), A = `end_header
@@ -1461,6 +1584,7 @@ format binary_little_endian 1.0
     return G(), q(), t = n, t;
   };
   var ft = () => new Jt();
+  let sharpBatchPackingModule = null;
   var Ut = class {
     constructor(t) {
       this.dataChanged = false, this.transformsChanged = false, this.colorTransformsChanged = false, this._updating = /* @__PURE__ */ new Set(), this._dirty = /* @__PURE__ */ new Set();
@@ -1524,7 +1648,9 @@ format binary_little_endian 1.0
       this._initialPacking = new Set();
       let disposed = false;
       // This bundled Emscripten initializer returns a module synchronously.
-      const packingReady = Promise.resolve(mt()).then((module) => { s = module; });
+      const packingReady = (t._sharpBatchFast
+        ? (sharpBatchPackingModule ||= Promise.resolve(mt()))
+        : Promise.resolve(mt())).then((module) => { s = module; });
       const I = (a) => {
         if (!s) {
           this._initialPacking.add(a);
@@ -1534,6 +1660,21 @@ format binary_little_endian 1.0
           return;
         }
         A(a);
+        // Both members of a fresh neutral stereo pair have identical geometry,
+        // selection and colors. Reuse the exact WASM output, never the sort order.
+        const pair = a._sharpPackPair;
+        delete a._sharpPackPair;
+        const eligible = pair && !a.data.changed && !a.selected && this._splatIndices.size===1 && this._offsets.get(a)===0;
+        if (eligible && pair.packed) {
+          const src=pair.packed;
+          this._data.set(src.data); this._positions.set(src.positions);
+          this._rotations.set(src.rotations); this._scales.set(src.scales);
+          pair.packed=null;
+          this.dataChanged=true; this.colorTransformsChanged=true;
+          this._initialPacking.delete(a);
+          if (window.__sharpBatchEventRendering) window.dispatchEvent(new Event("sharp-render-progress"));
+          return;
+        }
         const U = s._malloc(3 * a.data.vertexCount * 4), F = s._malloc(4 * a.data.vertexCount * 4), g = s._malloc(3 * a.data.vertexCount * 4), B = s._malloc(4 * a.data.vertexCount), C = s._malloc(a.data.vertexCount), c = s._malloc(8 * a.data.vertexCount * 4), p = s._malloc(3 * a.data.vertexCount * 4), u = s._malloc(4 * a.data.vertexCount * 4), S = s._malloc(3 * a.data.vertexCount * 4);
         s.HEAPF32.set(a.data.positions, U / 4), s.HEAPF32.set(a.data.rotations, F / 4), s.HEAPF32.set(a.data.scales, g / 4), s.HEAPU8.set(a.data.colors, B), s.HEAPU8.set(a.data.selection, C), s._pack(
           a.selected,
@@ -1560,6 +1701,7 @@ format binary_little_endian 1.0
         for (let M = 0; M < a.data.vertexCount; M++)
           this._transformIndices[L + M] = H;
         this._data.set(W, L * 8), this._positions.set(Z, L * 3), this._rotations.set(k, L * 4), this._scales.set(f, L * 3), s._free(U), s._free(F), s._free(g), s._free(B), s._free(C), s._free(c), s._free(p), s._free(u), s._free(S), this.dataChanged = true, this.colorTransformsChanged = true;
+        if (eligible) pair.packed={data:this._data,positions:this._positions,rotations:this._rotations,scales:this._scales};
         this._initialPacking.delete(a);
         if (window.__sharpBatchEventRendering) window.dispatchEvent(new Event("sharp-render-progress"));
       }, d = (a) => {
@@ -1859,6 +2001,21 @@ void main () {
       super(t, n), this._outlineThickness = 10, this._outlineColor = new dt(255, 165, 0, 255), this._renderData = null, this._depthIndex = new Uint32Array(), this._splatTexture = null, this._worker = null;
       const i = t.canvas, e = t.gl;
       let A, o, s, r, Q, I, d, a, U, F, g, B, C, c, p, u, S, W, Z;
+      let textureWidth=0, textureHeight=0, depthBytes=0;
+      const uploadDepth = (w) => {
+        e.bindBuffer(e.ARRAY_BUFFER,Z);
+        if (this.renderer._sharpReuseSize && depthBytes===w.byteLength && depthBytes>0) e.bufferSubData(e.ARRAY_BUFFER,0,w);
+        else { e.bufferData(e.ARRAY_BUFFER,w,e.STATIC_DRAW); depthBytes=w.byteLength; }
+      };
+      const uploadSplats = () => {
+        const d=this.renderData;
+        if (this.renderer._sharpReuseSize && textureWidth===d.width && textureHeight===d.height) {
+          e.texSubImage2D(e.TEXTURE_2D,0,0,0,d.width,d.height,e.RGBA_INTEGER,e.UNSIGNED_INT,d.data);
+        } else {
+          e.texImage2D(e.TEXTURE_2D,0,e.RGBA32UI,d.width,d.height,0,e.RGBA_INTEGER,e.UNSIGNED_INT,d.data);
+          textureWidth=d.width; textureHeight=d.height;
+        }
+      };
       this._resize = () => {
         this._camera && (this._camera.data.setSize(i.width, i.height), this._camera.update(), A = e.getUniformLocation(this.program, "projection"), e.uniformMatrix4fv(A, false, this._camera.data.projectionMatrix.buffer), o = e.getUniformLocation(this.program, "viewport"), e.uniform2fv(o, new Float32Array([i.width, i.height])));
       };
@@ -1866,7 +2023,7 @@ void main () {
         this._worker = Vt(), this._worker.onmessage = (V) => {
           if (V.data.depthIndex) {
             const { depthIndex: w } = V.data;
-            this._depthIndex = w, e.bindBuffer(e.ARRAY_BUFFER, Z), e.bufferData(e.ARRAY_BUFFER, w, e.STATIC_DRAW);
+            this._depthIndex = w, uploadDepth(w);
             if (this.renderer._sharpBatch && window.__sharpBatchEventRendering) window.dispatchEvent(new Event("sharp-render-progress"));
           }
         };
@@ -1876,6 +2033,7 @@ void main () {
           console.error("Cannot render without scene and camera");
           return;
         }
+        textureWidth=textureHeight=depthBytes=0;
         this._resize(), this._scene.addEventListener("objectAdded", f), this._scene.addEventListener("objectRemoved", H);
         for (const V of this._scene.objects)
           V instanceof X && V.addEventListener("objectChanged", L);
@@ -1889,7 +2047,8 @@ void main () {
         w.object instanceof X && w.object.addEventListener("objectChanged", L), M();
       }, H = (V) => {
         const w = V;
-        w.object instanceof X && w.object.removeEventListener("objectChanged", L), M();
+        w.object instanceof X && w.object.removeEventListener("objectChanged", L);
+        if (!this._scene._sharpReplacing) M();
       }, L = (V) => {
         const w = V;
         w.object instanceof X && this._renderData && this._renderData.markDirty(w.object);
@@ -1902,17 +2061,7 @@ void main () {
           return;
         }
         if (this.renderData.needsRebuild && this.renderData.rebuild(), this.renderData.dataChanged || this.renderData.transformsChanged || this.renderData.colorTransformsChanged) {
-          this.renderData.dataChanged && (e.activeTexture(e.TEXTURE0), e.bindTexture(e.TEXTURE_2D, this.splatTexture), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_WRAP_S, e.CLAMP_TO_EDGE), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_WRAP_T, e.CLAMP_TO_EDGE), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_MIN_FILTER, e.NEAREST), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_MAG_FILTER, e.NEAREST), e.texImage2D(
-            e.TEXTURE_2D,
-            0,
-            e.RGBA32UI,
-            this.renderData.width,
-            this.renderData.height,
-            0,
-            e.RGBA_INTEGER,
-            e.UNSIGNED_INT,
-            this.renderData.data
-          )), this.renderData.transformsChanged && (e.activeTexture(e.TEXTURE1), e.bindTexture(e.TEXTURE_2D, c), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_WRAP_S, e.CLAMP_TO_EDGE), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_WRAP_T, e.CLAMP_TO_EDGE), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_MIN_FILTER, e.NEAREST), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_MAG_FILTER, e.NEAREST), e.texImage2D(
+          this.renderData.dataChanged && (e.activeTexture(e.TEXTURE0), e.bindTexture(e.TEXTURE_2D, this.splatTexture), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_WRAP_S, e.CLAMP_TO_EDGE), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_WRAP_T, e.CLAMP_TO_EDGE), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_MIN_FILTER, e.NEAREST), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_MAG_FILTER, e.NEAREST), uploadSplats()), this.renderData.transformsChanged && (e.activeTexture(e.TEXTURE1), e.bindTexture(e.TEXTURE_2D, c), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_WRAP_S, e.CLAMP_TO_EDGE), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_WRAP_T, e.CLAMP_TO_EDGE), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_MIN_FILTER, e.NEAREST), e.texParameteri(e.TEXTURE_2D, e.TEXTURE_MAG_FILTER, e.NEAREST), e.texImage2D(
             e.TEXTURE_2D,
             0,
             e.RGBA32F,
@@ -1972,7 +2121,7 @@ void main () {
             [V.buffer, w.buffer, P.buffer]
           ), this.renderData.dataChanged = false, this.renderData.transformsChanged = false, this.renderData.colorTransformsChanged = false;
         }
-        this._camera.update(), this._worker?.postMessage({ viewProj: this._camera.data.viewProj.buffer }), e.viewport(0, 0, i.width, i.height), e.clearColor(0, 0, 0, 0), e.clear(e.COLOR_BUFFER_BIT), e.disable(e.DEPTH_TEST), e.enable(e.BLEND), e.blendFuncSeparate(e.ONE_MINUS_DST_ALPHA, e.ONE, e.ONE_MINUS_DST_ALPHA, e.ONE), e.blendEquationSeparate(e.FUNC_ADD, e.FUNC_ADD), e.uniformMatrix4fv(A, false, this._camera.data.projectionMatrix.buffer), e.uniformMatrix4fv(r, false, this._camera.data.viewMatrix.buffer), e.bindBuffer(e.ARRAY_BUFFER, W), e.vertexAttribPointer(B, 2, e.FLOAT, false, 0, 0), e.bindBuffer(e.ARRAY_BUFFER, Z), e.bufferData(e.ARRAY_BUFFER, this.depthIndex, e.STATIC_DRAW), e.vertexAttribIPointer(C, 1, e.INT, 0, 0), e.vertexAttribDivisor(C, 1), e.drawArraysInstanced(e.TRIANGLE_FAN, 0, 4, this.depthIndex.length);
+        this._camera.update(), this._worker?.postMessage({ viewProj: this._camera.data.viewProj.buffer }), e.viewport(0, 0, i.width, i.height), e.clearColor(0, 0, 0, 0), e.clear(e.COLOR_BUFFER_BIT), e.disable(e.DEPTH_TEST), e.enable(e.BLEND), e.blendFuncSeparate(e.ONE_MINUS_DST_ALPHA, e.ONE, e.ONE_MINUS_DST_ALPHA, e.ONE), e.blendEquationSeparate(e.FUNC_ADD, e.FUNC_ADD), e.uniformMatrix4fv(A, false, this._camera.data.projectionMatrix.buffer), e.uniformMatrix4fv(r, false, this._camera.data.viewMatrix.buffer), e.bindBuffer(e.ARRAY_BUFFER, W), e.vertexAttribPointer(B, 2, e.FLOAT, false, 0, 0), e.bindBuffer(e.ARRAY_BUFFER, Z), (this.renderer._sharpReuseSize && this.depthIndex.length > 0 ? undefined : uploadDepth(this.depthIndex)), e.vertexAttribIPointer(C, 1, e.INT, 0, 0), e.vertexAttribDivisor(C, 1), e.drawArraysInstanced(e.TRIANGLE_FAN, 0, 4, this.depthIndex.length);
       }, this._dispose = () => {
         if (!this._scene || !this._camera || !this.renderData) {
           console.error("Cannot dispose without scene and camera");
@@ -2045,7 +2194,8 @@ void main () {
         const o = i.clientWidth, s = i.clientHeight;
         (i.width !== o || i.height !== s) && this.setSize(o, s);
       }, this.setSize = (o, s) => {
-        i.width = o, i.height = s, this._gl.viewport(0, 0, i.width, i.height);
+        if (!this._sharpReuseSize || i.width !== o || i.height !== s) { i.width = o; i.height = s; }
+        this._gl.viewport(0, 0, i.width, i.height);
         for (const r of A)
           r.resize();
       }, this.render = (o, s) => {

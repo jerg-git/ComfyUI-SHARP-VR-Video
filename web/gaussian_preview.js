@@ -15,7 +15,7 @@ const EXTENSION_FOLDER = (() => {
 
 console.log("[Gaussian Stereo] Loading extension...");
 
-const workerUrl = `/extensions/${EXTENSION_FOLDER}/viewer_gaussian.html?batch=1&worker=1&v=camera-controls-2`;
+const workerUrl = `/extensions/${EXTENSION_FOLDER}/viewer_gaussian.html?batch=1&worker=1&v=sharp-batch-fast-18`;
 function startSharedRenderer() {
     // This belongs to the document, not to a graph or a DOM widget.
     if (document.getElementById('sharp-vr-video-shared-renderer')) return;

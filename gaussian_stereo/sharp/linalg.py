@@ -98,6 +98,39 @@ def quaternions_from_rotation_matrices(matrices: torch.Tensor) -> torch.Tensor:
     return q.reshape(batch_shape + (4,))
 
 
+def quaternions_from_rotation_matrices_dense(matrices: torch.Tensor) -> torch.Tensor:
+    """Same Shepperd branches as above, without dynamic CUDA indexing.
+
+    Choose the denominator and numerators elementwise. No boolean gathers,
+    host-side mask checks, or branch-dependent allocations are needed.
+    """
+    if matrices.shape[-2:] != (3, 3):
+        raise ValueError(f"matrices have invalid shape {matrices.shape}")
+    r = matrices
+    a, b, c = r[..., 0, 0], r[..., 1, 1], r[..., 2, 2]
+    trace = a + b + c
+    m1 = trace > 0
+    m2 = (~m1) & (a > b) & (a > c)
+    m3 = (~m1) & (~m2) & (b > c)
+    m4 = (~m1) & (~m2) & (~m3)
+    choose = torch.where
+    denom = choose(m1, trace + 1.0, choose(m2, 1 + a - b - c,
+                   choose(m3, 1 + b - a - c, 1 + c - a - b)))
+    s = denom.clamp(min=1e-10).sqrt() * 2
+    x = r[..., 2, 1] - r[..., 1, 2]
+    y = r[..., 0, 2] - r[..., 2, 0]
+    z = r[..., 1, 0] - r[..., 0, 1]
+    xy = r[..., 0, 1] + r[..., 1, 0]
+    xz = r[..., 0, 2] + r[..., 2, 0]
+    yz = r[..., 1, 2] + r[..., 2, 1]
+    dominant = 0.25 * s
+    qw = choose(m1, dominant, choose(m2, x, choose(m3, y, z)) / s)
+    qx = choose(m2, dominant, choose(m1, x, choose(m3, xy, xz)) / s)
+    qy = choose(m3, dominant, choose(m1, y, choose(m2, xy, yz)) / s)
+    qz = choose(m4, dominant, choose(m1, z, choose(m2, xz, yz)) / s)
+    return torch.stack((qw, qx, qy, qz), dim=-1)
+
+
 def get_cross_product_matrix(vectors: torch.Tensor) -> torch.Tensor:
     """Generate cross product matrix for vector exterior product."""
     if not vectors.shape[-1] == 3:

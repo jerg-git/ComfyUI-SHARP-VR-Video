@@ -15,6 +15,9 @@ import abc
 import copy
 import logging
 import math
+import os
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Literal, NamedTuple, Sequence, Tuple, Union
 
 log = logging.getLogger("sharp")
@@ -441,6 +444,68 @@ class VisionTransformer(nn.Module):
 # ===========================================================================
 
 
+# Scope experimental tile batching to video encode; preview retains the
+# original cap. Remember OOM reductions per device/dtype/requested cap.
+_video_patch_cap = ContextVar("sharp_video_patch_cap", default=None)
+_patch_oom_caps = {}
+_patch_log_state = {}
+
+
+@contextmanager
+def video_patch_batching(enabled):
+    cap = None
+    if enabled:
+        try:
+            cap = max(1, min(16, int(os.environ.get("SHARP_VR_PATCH_BATCH", "8"))))
+        except ValueError:
+            cap = 8
+    token = _video_patch_cap.set(cap)
+    try:
+        yield
+    finally:
+        _video_patch_cap.reset(token)
+
+
+def _patch_chunk_plan(patches, mem_free):
+    requested = _video_patch_cap.get() if patches.device.type == "cuda" else None
+    cap = requested if requested is not None else 4
+    key = (str(patches.device), str(patches.dtype), cap) if requested is not None else None
+    if key is not None:
+        cap = min(cap, _patch_oom_caps.get(key, cap))
+    estimate = 200 * 1024 * 1024
+    baseline = max(1, int(mem_free * 0.8 / estimate))
+    # Keep more headroom when increasing concurrency. FP32 uses twice
+    # the reference FP16 activation estimate. The original cap=4 is unchanged.
+    if cap > 4:
+        aggressive = max(4, int(mem_free * 0.6 / (estimate * max(1.0, patches.element_size() / 2))))
+        baseline = min(baseline, aggressive)
+    size = min(cap, patches.shape[0], baseline)
+    if key is not None and _patch_log_state.get(key) != size:
+        log.info("[SHARP VR Video] ViT patch batching: requested=%d, actual=%d, total=%d",
+                 requested, size, patches.shape[0])
+        _patch_log_state[key] = size
+    return size, key
+
+
+def _encode_patch_chunk(encoder, patches, start, size, key):
+    while True:
+        end = min(start + size, patches.shape[0])
+        try:
+            encoded, intermediate = encoder(patches[start:end])
+            return end, size, encoded, intermediate
+        except torch.cuda.OutOfMemoryError:
+            if key is None or size <= 1:
+                raise
+        # The exception scope has ended; release its traceback and unused
+        # allocator blocks before retrying the SAME uncommitted patch range.
+        comfy.model_management.throw_exception_if_processing_interrupted()
+        size = max(1, size // 2)
+        _patch_oom_caps[key] = min(size, _patch_oom_caps.get(key, size))
+        _patch_log_state[key] = size
+        log.warning("[SHARP VR Video] ViT patch OOM; retrying at %d patches per call", size)
+        comfy.model_management.soft_empty_cache()
+
+
 @torch.fx.wrap
 def split(
     image: torch.Tensor, overlap_ratio: float = 0.25, patch_size: int = 384
@@ -659,16 +724,13 @@ class SlidingPyramidNetwork(nn.Module):
         log.debug(f"[SPN] patches: {self._vram_gb(_dev):.2f} GB, x0={x0_tile_size} x1={x1_tile_size} x2={x2_tile_size} total={x_pyramid_patches.shape[0]}")
 
         # Dynamic chunking based on free VRAM (same pattern as ComfyUI's attention_split)
-        MAX_PATCH_CHUNK = 4
         N = x_pyramid_patches.shape[0]
         mem_free = comfy.model_management.get_free_memory(x_pyramid_patches.device)
-        patch_mem_estimate = 200 * 1024 * 1024  # ~200 MB per patch through ViT
-        chunk_size = max(1, int(mem_free * 0.8 / patch_mem_estimate))
-        chunk_size = min(chunk_size, N, MAX_PATCH_CHUNK)
+        chunk_size, patch_key = _patch_chunk_plan(x_pyramid_patches, mem_free)
 
-        # Process first chunk to discover output shapes, then pre-allocate
-        first_end = min(chunk_size, N)
-        first_enc, first_inter = self.patch_encoder(x_pyramid_patches[:first_end])
+        # Process first chunk to discover output shapes, then pre-allocate.
+        first_end, chunk_size, first_enc, first_inter = _encode_patch_chunk(
+            self.patch_encoder, x_pyramid_patches, 0, chunk_size, patch_key)
 
         x_pyramid_encodings = torch.empty(
             N, *first_enc.shape[1:], device=first_enc.device, dtype=first_enc.dtype,
@@ -688,15 +750,17 @@ class SlidingPyramidNetwork(nn.Module):
 
         log.debug(f"[SPN] after first chunk ({first_end}/{N}): {self._vram_gb(_dev):.2f} GB, chunk_size={chunk_size}")
 
-        for i in range(first_end, N, chunk_size):
+        i = first_end
+        while i < N:
             comfy.model_management.throw_exception_if_processing_interrupted()
-            end = min(i + chunk_size, N)
-            enc, inter = self.patch_encoder(x_pyramid_patches[i:end])
+            end, chunk_size, enc, inter = _encode_patch_chunk(
+                self.patch_encoder, x_pyramid_patches, i, chunk_size, patch_key)
             x_pyramid_encodings[i:end] = enc
             del enc
             for layer_id, feat in inter.items():
                 patch_intermediate_features[layer_id][i:end] = feat
             del inter
+            i = end
         del x_pyramid_patches
         # Release cached CUDA blocks from ViT forward passes
         comfy.model_management.soft_empty_cache()

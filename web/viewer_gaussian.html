@@ -206,7 +206,7 @@
     </div>
 
     <!-- Load bundled gsplat.js -->
-    <script src="./js/gsplat-bundle.js?v=event-render-2"></script>
+    <script src="./js/gsplat-bundle.js?v=sharp-batch-fast-18"></script>
 
     <script type="module">
         // Use the globally exported GSPLAT
@@ -1057,7 +1057,7 @@
             }
         }
 
-        async function loadPLYFromURL(url, filename, extrinsics, intrinsics, batch = false) {
+        async function loadPLYFromURL(url, filename, extrinsics, intrinsics, batch = false, detail = {}, fastNeutral = false) {
             try {
                 // Reset per-model adjustment snapshots.
                 originalPositions = null;
@@ -1078,11 +1078,10 @@
                 // Reset lock state
                 isResolutionLocked = false;
 
-                // Clear ALL existing objects from scene
-                if (scene.objects && scene.objects.length > 0) {
+                // Fast batches replace old splats atomically after decoding.
+                if (!fastNeutral) {
+                    scene._sharpBatchFast = sceneRight._sharpBatchFast = false;
                     while (scene.objects.length > 0) scene.removeObject(scene.objects[0]);
-                }
-                if (sceneRight.objects && sceneRight.objects.length > 0) {
                     while (sceneRight.objects.length > 0) sceneRight.removeObject(sceneRight.objects[0]);
                 }
 
@@ -1101,13 +1100,33 @@
                 console.log('[GaussianViewer] Loading from URL:', url);
 
                 // Load PLY directly from URL — gsplat.js streams it
-                await SPLAT.PLYLoader.LoadAsync(url, scene);
+                if (fastNeutral) {
+                    const pair = await SPLAT.PLYLoader.LoadSharpBatchPairAsync(url, detail);
+                    currentSplat = pair.left; currentSplatRight = pair.right;
+                    if (pair.shared) {
+                        scene.replaceSharpBatchObject(currentSplat);
+                        sceneRight.replaceSharpBatchObject(currentSplatRight);
+                        detail.shared=1;
+                    } else {
+                        scene._sharpBatchFast = sceneRight._sharpBatchFast = false;
+                        while (scene.objects.length) scene.removeObject(scene.objects[0]);
+                        while (sceneRight.objects.length) sceneRight.removeObject(sceneRight.objects[0]);
+                        scene.addObject(currentSplat); sceneRight.addObject(currentSplatRight);
+                        detail.shared=0;
+                    }
+                } else if (batch && isSharedWorker && typeof SPLAT.PLYLoader.LoadSharpBatchAsync === 'function') {
+                    await SPLAT.PLYLoader.LoadSharpBatchAsync(url, scene, detail);
+                } else {
+                    await SPLAT.PLYLoader.LoadAsync(url, scene);
+                }
 
                 // Get the loaded splat (last object in scene)
                 if (scene.objects && scene.objects.length > 0) {
                     currentSplat = scene.objects[scene.objects.length - 1];
-                    currentSplatRight = currentSplat.clone();
-                    sceneRight.addObject(currentSplatRight);
+                    if (!fastNeutral) {
+                        currentSplatRight = currentSplat.clone();
+                        sceneRight.addObject(currentSplatRight);
+                    }
 
                     if (currentSplat.bounds) {
                         const center = currentSplat.bounds.center();
@@ -1122,11 +1141,11 @@
                         originalPositions = new Float32Array(originalPositions);
                     }
                     const rightPositions = getSplatPositionArray(currentSplatRight);
-                    originalPositionsRight = rightPositions ? new Float32Array(rightPositions) : null;
+                    originalPositionsRight = detail.shared ? originalPositions : (rightPositions ? new Float32Array(rightPositions) : null);
                     originalRotations = currentSplat.data?.rotations
                         ? new Float32Array(currentSplat.data.rotations) : null;
-                    originalRotationsRight = currentSplatRight.data?.rotations
-                        ? new Float32Array(currentSplatRight.data.rotations) : null;
+                    originalRotationsRight = detail.shared ? originalRotations : (currentSplatRight.data?.rotations
+                        ? new Float32Array(currentSplatRight.data.rotations) : null);
 
                     // Store original scales and apply compensation
                     if (currentSplat.data && currentSplat.data.scales) {
@@ -1135,9 +1154,11 @@
 
                         originalScales = new Float32Array(scales);
                         const rightScales = currentSplatRight.data.scales;
-                        originalScalesRight = new Float32Array(rightScales);
-                        currentSplat.data.changed = true;
-                        currentSplatRight.data.changed = true;
+                        originalScalesRight = detail.shared ? originalScales : new Float32Array(rightScales);
+                        if (!detail.shared) {
+                            currentSplat.data.changed = true;
+                            currentSplatRight.data.changed = true;
+                        }
 
                         console.log('[GaussianViewer] Applied scale compensation:', gaussianScaleCompensation.toFixed(2), 'x,', numGaussians, 'gaussians');
                     } else {
@@ -1746,10 +1767,15 @@
                 // Do not allow orbit or adjustment gestures during capture.
                 viewerContainer.style.pointerEvents = 'none';
                 document.getElementById('controlsBar').style.pointerEvents = 'none';
+                const fastNeutral = !!(isSharedWorker && job.browser_fast && job.stereo?.depth_scale === 1 && job.stereo?.splat_scale === 1 && typeof SPLAT.PLYLoader.LoadSharpBatchPairAsync === 'function');
+                renderer._sharpReuseSize = rendererRight._sharpReuseSize = fastNeutral;
                 viewMode.checked = true;
                 updateViewMode();
                 smoothedStereoIntensity = Number(stereoSlider.value) || 0;
-                await loadPLYFromURL(job.url, job.filename, job.extrinsics, job.intrinsics, true);
+                const tLoad = performance.now();
+                const loadDetail = {};
+                await loadPLYFromURL(job.url, job.filename, job.extrinsics, job.intrinsics, true, loadDetail, fastNeutral);
+                const tReady = performance.now();
                 // Loading resets the multipliers: reapply immediately, every frame.
                 applyBatchGeometrySettings();
                 const ready = (r) => {
@@ -1777,9 +1803,19 @@
                     }
                 }
                 // Draw with the now-current focal uniforms and sorted indices.
+                const tCompose = performance.now();
                 renderStereoNow();
                 const finalCanvas = composeStereoCanvas();
-                reply({image:finalCanvas.toDataURL('image/png')});
+                const tPixels = performance.now();
+                const timings = {...loadDetail, load:(tReady-tLoad)/1000, ready:(tCompose-tReady)/1000,
+                                 compose:(tPixels-tCompose)/1000, pixels:0};
+                if (isSharedWorker) {
+                    // The same composited canvas as the legacy PNG path; keep it
+                    // available for fallback without reconstructing or rerendering.
+                    reply({canvas:finalCanvas,timings});
+                } else {
+                    reply({image:finalCanvas.toDataURL('image/png')});
+                }
             } catch (err) { reply({error:String(err.message || err)}); }
             finally {
                 batchBusy = false;
@@ -1809,25 +1845,49 @@
             async function poll() {
                 if (stopped) return;
                 try {
-                    const endpoint = '/sharp_vr_video_batch/next?worker=1&wait=1' + (window.parent === window ? '&dedicated=1' : '');
+                    const endpoint = '/sharp_vr_video_batch/next?worker=1&wait=1' + (SPLAT.PLYLoader.SupportsSharpPacked ? '&packed=1' : '') + (window.parent === window ? '&dedicated=1' : '');
                     const response = await fetch(endpoint, {cache:'no-store'});
                     if (!response.ok) throw new Error('Polling HTTP ' + response.status);
                     const {job} = await response.json();
                     if (job) {
                         setStatus('Rendering frame');
-                        let output;
+                        let output, done;
                         try {
                             const result = await captureBatchFrame(job);
                             if (result?.error) throw new Error(result.error);
-                            if (!result?.image?.startsWith('data:image/png;base64,')) throw new Error('No PNG returned');
-                            output = {png:result.image.split(',')[1]};
+                            const frame = result?.canvas;
+                            if (!frame) throw new Error('No rendered canvas returned');
+                            const timings = result.timings;
+                            const start = performance.now();
+                            // Only use raw transfer when the server explicitly advertises
+                            // it and the canvas dimensions match the expected frame.
+                            if (job.rgba_size?.[0] === frame.width && job.rgba_size?.[1] === frame.height) {
+                                try {
+                                    const pixels = frame.getContext('2d').getImageData(0,0,frame.width,frame.height);
+                                    timings.pixels = (performance.now()-start)/1000;
+                                    const raw = await fetch('/sharp_vr_video_batch/rgba/' + encodeURIComponent(job.id), {
+                                        method:'POST', headers:{'Content-Type':'application/octet-stream',
+                                            'X-Sharp-Timings':JSON.stringify(timings)}, body:pixels.data
+                                    });
+                                    if (raw.ok || raw.status === 404) done = raw;
+                                } catch (err) {
+                                    console.warn('[SHARP worker] Raw transfer unavailable; falling back to PNG', err);
+                                }
+                            }
+                            if (!done) {
+                                const encodeStart = performance.now();
+                                const image = frame.toDataURL('image/png');
+                                timings.pixels = (performance.now()-encodeStart)/1000;
+                                if (!image.startsWith('data:image/png;base64,')) throw new Error('No PNG returned');
+                                output = {png:image.split(',')[1],timings};
+                            }
                         } catch (error) { output = {error:String(error.message || error)}; }
-                        const done = await fetch('/sharp_vr_video_batch/complete', {
+                        if (!done) done = await fetch('/sharp_vr_video_batch/complete', {
                             method:'POST', headers:{'Content-Type':'application/json'},
                             body:JSON.stringify({id:job.id,...output})
                         });
                         if (!done.ok && done.status !== 404) throw new Error('Capture upload HTTP ' + done.status);
-                        setStatus(output.error ? 'Frame error: ' + output.error : 'Ready / waiting for frames');
+                        setStatus(output?.error ? 'Frame error: ' + output.error : 'Ready / waiting for frames');
                     }
                 } catch (error) {
                     console.error('[SHARP worker]',error);
