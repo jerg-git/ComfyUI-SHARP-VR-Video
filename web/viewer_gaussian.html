@@ -206,7 +206,7 @@
     </div>
 
     <!-- Load bundled gsplat.js -->
-    <script src="./js/gsplat-bundle.js?v=sharp-batch-fast-18"></script>
+    <script src="./js/gsplat-bundle.js?v=sharp-projection-29"></script>
 
     <script type="module">
         // Use the globally exported GSPLAT
@@ -523,6 +523,12 @@
 
             stereoValue.textContent = `${targetIntensity > 0 ? '+' : ''}${targetIntensity}%`;
             const fixedStereo = isBatchViewer && batchStereo?.mode === 'fixed';
+            // Parallel cameras preserve the same viewing axes. Avoid coarse
+            // depth bins for static splats in that mode; toe-in keeps its sorter.
+            const precise = isStereoEnabled() && (fixedStereo
+                ? batchStereo.projection !== 'Toe-in' : mode === 'parallel');
+            if (renderer) renderer._sharpPreciseSort = precise;
+            if (rendererRight) rendererRight._sharpPreciseSort = precise;
             // Always clear any previous off-axis shift when switching to legacy/mono.
             if (!fixedStereo || !isStereoEnabled()) {
                 cameraLeft.data.shiftX = cameraRight.data.shiftX = 0;

@@ -1,6 +1,6 @@
 [project]
 name = "sharp-vr-video"
-version = "0.2.0"
+version = "0.2.10"
 description = "Experimental SHARP Gaussian splat batch stereoscopic video conversion for ComfyUI"
 license = { file = "LICENSE" }
 dependencies = ["huggingface_hub>=0.20.0", "tqdm"]

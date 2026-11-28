@@ -1,3 +1,16 @@
+# v0.2.10 — Parallel stereo rendering fix and renderer launcher
+
+- Added a **Launch optimized renderer (Windows)** button on the batch node to open the optional isolated browser renderer without leaving the workflow. Direct local Windows connections only; manual BAT and ordinary dedicated renderer options remain available.
+- Fixed black speckling around bright specular highlights observed with parallel off-axis stereo, using precise float32 depth sorting and more robust Gaussian projection shader math.
+- Added Windows display-awake protection during active rendering and an optional isolated Chrome/Edge renderer launcher to reduce background throttling. Normal Windows power settings remain unchanged.
+- Safe batch RGB clipping before 8-bit conversion. No highlight compression or cosmetic repair is applied.
+- Retains the v0.2.0 speedups, optional CuPy acceleration, existing camera controls, audio/FPS handling, VHS Meta Batch compatibility and Queue Manager protection.
+- No new mandatory dependencies or changes to the included workflow.
+
+The renderer fix was visually verified in v0.2.8 on an RTX 5080: all 40 frames of the affected 1400 x 784 clip completed, with warm processing times of 0.440–0.461 seconds/frame. The two fixes were tested together, so their individual contributions are not isolated. Broader compatibility remains to be tested.
+
+Update the extension, restart ComfyUI and hard-refresh the browser (Ctrl+F5). The dedicated Windows renderer launcher is optional. Existing CuPy installations do not need to be changed. Intermediate diagnostic widgets have been removed; if upgrading from those test builds, reload the included workflow or replace the batch node if obsolete widgets persist.
+
 # SHARP VR Video v0.2.0 — Major performance update
 
 A substantial under-the-hood speed upgrade to batch stereoscopic video generation, with **no workflow changes required** for v0.1.5 users.

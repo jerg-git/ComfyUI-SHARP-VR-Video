@@ -170,7 +170,14 @@ def run_sharp_inference(model_config, image, output_dir, focal_length_mm=30.0,
     patcher = _load_sharp_model(model_config)
     device = patcher.load_device
     profile = _ReconstructionProfile(device) if video_batch and timings is not None else None
-    image_np = (image[0].detach().cpu().numpy() * 255.0).astype(np.uint8)
+    source_rgb = image[0].detach().cpu().numpy()
+    if video_batch:
+        # Preserve byte conversion for normal normalized RGB; sanitize invalid
+        # values before casting so they cannot wrap around to dark colors.
+        low, high = source_rgb.min(), source_rgb.max()
+        if not (low >= 0 and high <= 1):
+            source_rgb = np.clip(np.nan_to_num(source_rgb, nan=0, posinf=1, neginf=0), 0, 1)
+    image_np = (source_rgb * 255.0).astype(np.uint8)
     height, width = image_np.shape[:2]
     use_camera = extrinsics is not None and intrinsics is not None
 

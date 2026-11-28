@@ -20,3 +20,9 @@ This package was rebuilt from the v0.1.1 release as the base, then updated to in
 Version 0.1.3 was packaged from the latest validated 0.1.2 Meta Batch / switch-support build and documented as the first releasable consolidated version of this fork.
 
 - v0.2.0: consolidates single-frame inference and browser overlap, optional CuPy covariance and packed transport kernels, WebGL resource updates and bridge wakeups. Two-frame inference experiment removed. Existing upstream licensing unchanged.
+
+- v0.2.1 test: scoped Windows display-awake request and optional isolated Chromium renderer launcher; existing upstream licensing unchanged.
+
+- v0.2.9: precise depth ordering and static splat projection shader robustness in the MIT-licensed gsplat renderer; safe batch RGB sanitization. Existing upstream licensing unchanged.
+
+- v0.2.10: optional local Windows renderer launch button and fixed-argument backend launch endpoint. No changes to upstream rendering code or licensing.

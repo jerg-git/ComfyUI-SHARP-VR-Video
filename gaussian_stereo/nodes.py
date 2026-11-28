@@ -487,7 +487,8 @@ class SharpVRVideoBatch(GaussianStereoPreview):
             progress.update(1)
             console_progress.update(1)
 
-        with tqdm(total=count, desc="SHARP stereo", unit="frame",
+        from .display_awake import display_awake
+        with display_awake(), tqdm(total=count, desc="SHARP stereo", unit="frame",
                   dynamic_ncols=True, mininterval=0.1) as console_progress:
             try:
                 packed_video = (stereo.get('depth_scale') == 1 and stereo.get('splat_scale') == 1 and packed_browser_available())

@@ -15,7 +15,7 @@ const EXTENSION_FOLDER = (() => {
 
 console.log("[Gaussian Stereo] Loading extension...");
 
-const workerUrl = `/extensions/${EXTENSION_FOLDER}/viewer_gaussian.html?batch=1&worker=1&v=sharp-batch-fast-18`;
+const workerUrl = `/extensions/${EXTENSION_FOLDER}/viewer_gaussian.html?batch=1&worker=1&v=sharp-projection-29`;
 function startSharedRenderer() {
     // This belongs to the document, not to a graph or a DOM widget.
     if (document.getElementById('sharp-vr-video-shared-renderer')) return;
@@ -384,6 +384,27 @@ app.registerExtension({
                     window.open(workerUrl, 'sharp-vr-video-dedicated-renderer', 'noopener');
                 }, {serialize:false});
                 if (open) open.serialize = false;
+                // Local Windows optimized launcher. Frontend-only, never serialized.
+                let launching = false;
+                const launch = this.addWidget('button', 'Launch optimized renderer (Windows)', null, async () => {
+                    if (launching) return;
+                    launching = true;
+                    try {
+                        const response = await fetch('/sharp_vr_video_batch/launch_renderer', {
+                            method: 'POST', headers: {'X-Sharp-Renderer-Launch': '1'},
+                            credentials: 'same-origin', cache: 'no-store',
+                        });
+                        const result = await response.json();
+                        if (!response.ok || result.status !== 'launched') {
+                            window.alert(result.message || 'Could not launch the optimized renderer.');
+                        }
+                    } catch (error) {
+                        window.alert('Could not contact the local renderer launcher. Restart ComfyUI and refresh this page, or use launch_renderer_windows.bat.');
+                    } finally {
+                        launching = false;
+                    }
+                }, {serialize:false});
+                if (launch) launch.serialize = false;
                 this.refreshSharpMotionWidgets();
                 this.setSize([520, Math.max(400, this.computeSize?.()[1] ?? 400)]);
                 return r;

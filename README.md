@@ -2,7 +2,7 @@
 
 Experimental, AI-assisted ComfyUI extension for converting ordinary 2D video frames into full side-by-side stereoscopic frames using Apple SHARP and the gsplat.js renderer. An independent fork of [Well-Made/ComfyUI-SHARP-Gaussian-Stereo](https://github.com/Well-Made/ComfyUI-SHARP-Gaussian-Stereo), focused on batch video and VR experiments. Not affiliated with Apple.
 
-**v0.2.0 — Performance update.** SHARP model use is subject to Apple's research-only license (see below).
+**v0.2.10 — Parallel stereo artifact fix, display-idle protection and in-node renderer launcher.** SHARP model use is subject to Apple's research-only license (see below).
 
 ## Features
 
@@ -12,6 +12,16 @@ Experimental, AI-assisted ComfyUI extension for converting ordinary 2D video fra
 - RAM-only intermediate Gaussian transport (PLY or accelerated packed format), frame-based progress and quiet console logs.
 - Shared browser renderer independent of the active workflow, plus a dedicated renderer page.
 - Retains the interactive single-image preview and optional PLY export.
+
+## What's new in v0.2.10
+
+- Fixed black speckling observed in bright specular reflections under parallel off-axis stereo. The renderer now uses precise float32 depth ordering for parallel stereo and a numerically robust projected-Gaussian eigenvector calculation. Both changes are retained; their individual contribution has not been isolated.
+- No highlight compression, image filtering or new repair controls. Normal source RGB is preserved; invalid or out-of-range batch RGB is safely sanitized before 8-bit conversion.
+- Windows display-awake protection during active rendering, plus an optional isolated Chrome/Edge renderer launcher (see below). No manual power-plan changes needed.
+- New **Launch optimized renderer (Windows)** button on the batch node. No workflow edits, manual BAT launch or queue execution required.
+- All v0.2.0 acceleration paths and existing sample workflow retained. No additional dependencies.
+
+On the RTX 5080, a 40-frame 1400 x 784 silent test clip that previously exhibited black speckles rendered cleanly with the two renderer fixes in v0.2.8. Warm 16- and 8-frame batches took 0.440 and 0.461 s/frame respectively. Broader visual and hardware regression testing is still outstanding. If you tried intermediate diagnostic builds, reload the included workflow or remove/re-add the batch node if its obsolete experimental widgets persist.
 
 ## What's new in v0.2.0
 
@@ -160,6 +170,14 @@ The VHS batch node serializes one frame at a time to binary PLY or, when optiona
 ### Workflow-independent batch renderer
 
 The shared renderer now belongs to the browser document, not to the workflow graph. Switching between workflows, panning, collapsing or removing the node from the visible graph no longer tears down the renderer. A shared WebGL worker is started automatically when the ComfyUI frontend initializes. The node no longer contains its own preview iframe; the single-image preview is unchanged. Use the batch node's **Open dedicated SHARP renderer** button to open an independent browser page if you want to close the ComfyUI UI. The server prefers an active standalone renderer for newly queued frames. Open it before queueing, and leave it running if closing the main UI. Its URL is `http://127.0.0.1:8188/extensions/ComfyUI-SHARP-VR-Video/viewer_gaussian.html?batch=1&worker=1` for a default local installation. Keep at least one renderer page running; do not close the browser during a job. Actual browser background/minimized-tab throttling and GPU suspension are browser-dependent. For best reliability keep the dedicated renderer in a visible browser window. If a browser is closed during a claimed frame, that frame may time out; do not reload or close the currently rendering browser mid-job. The worker performs explicit WebGL draws instead of relying on requestAnimationFrame; it does not continuously render while idle. RAM-only transport and existing stereo parameters are retained.
+
+### Prevent display-idle stalls (Windows, v0.2.1 test)
+
+Some browser/GPU configurations may stall rendering when Windows powers off the display, even if the PC never sleeps. During each active SHARP render batch, the node now requests that Windows keep the display awake, then restores its previous thread execution state on completion, interruption or error. This is automatic on Windows, changes no power-plan settings, needs no admin privileges, and does not prevent manual monitor power-off, locking, or sleep. It is released between Meta Batch chunks and during downstream video encoding; it is not a guarantee against all browser/driver suspension. Disable it if desired with `set SHARP_VR_KEEP_DISPLAY_AWAKE=0` before launching ComfyUI. Non-Windows hosts are unchanged.
+
+For additional protection, start ComfyUI normally, open its UI at `http://127.0.0.1:8188` (or `localhost` with your actual port), then click **Launch optimized renderer (Windows)** on the batch node before queueing. The button is available automatically in existing workflows. It is restricted to direct local Windows ComfyUI connections; remote clients should use the existing **Open dedicated SHARP renderer** button instead. If a standalone renderer is already active, close it while idle and wait a few seconds before launching the optimized one. The button uses the same browser settings and profile as the BAT file, and attempts to avoid duplicate launches via an active-worker check and a short cooldown. Alternatively, double-click `launch_renderer_windows.bat` in this extension folder before queueing. It opens a dedicated renderer in an isolated Chrome or Edge profile with Chromium background timer, renderer priority and window-occlusion throttling switches disabled. Keep that window open and visible. It defaults to `http://127.0.0.1:8188`; for a different local port, pass the server origin as the first argument (e.g. `launch_renderer_windows.bat http://127.0.0.1:8190`). It does not alter your normal browser profile. The separate profile is stored under `%LOCALAPPDATA%\SHARP-VR-Video\RendererProfile` (separate Chrome/Edge subfolders). Close the dedicated window to stop using the switches. Do not close the renderer during processing. Browser switches are best-effort and may change across browser versions.
+
+Keep your usual Windows display timeout; no manual power-setting change is required. To verify automatic protection, optionally shorten the timeout and run a longer job. The monitor should stay on during each SHARP render batch and become eligible for idle power-off afterward. These measures intentionally keep the display on during rendering; monitor-off rendering is not guaranteed.
 
 ### Background-tab scheduling
 

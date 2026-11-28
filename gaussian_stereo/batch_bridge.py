@@ -9,6 +9,7 @@ import time
 import uuid
 from aiohttp import web
 from server import PromptServer
+from .renderer_launcher import launch_renderer
 
 _pending = {}
 _lock = threading.Lock()
@@ -27,7 +28,17 @@ def register_routes():
     routes.post("/sharp_vr_video_batch/complete")(_complete)
     routes.post("/sharp_vr_video_batch/rgba/{job_id}")(_complete_rgba)
     routes.get("/sharp_vr_video_batch/ply/{job_id}.ply")(_ply)
+    routes.post("/sharp_vr_video_batch/launch_renderer")(_launch_renderer)
     _registered = True
+
+
+def _dedicated_active():
+    with _lock:
+        return _dedicated_seen is not None and time.monotonic() - _dedicated_seen < 10
+
+
+async def _launch_renderer(request):
+    return await launch_renderer(request, _dedicated_active)
 
 
 async def _next(request):
