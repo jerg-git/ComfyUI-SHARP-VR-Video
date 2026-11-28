@@ -26,3 +26,5 @@ Version 0.1.3 was packaged from the latest validated 0.1.2 Meta Batch / switch-s
 - v0.2.9: precise depth ordering and static splat projection shader robustness in the MIT-licensed gsplat renderer; safe batch RGB sanitization. Existing upstream licensing unchanged.
 
 - v0.2.10: optional local Windows renderer launch button and fixed-argument backend launch endpoint. No changes to upstream rendering code or licensing.
+
+- v0.3.0: optional local TensorRT for RTX backend uses the unofficial Cool2009/SHARP-onnx FP16 derivative (revision `7871e64`) of the Apple SHARP model; neither derivative weights nor generated engine are included. Apple Machine Learning Research Model is licensed under the Apple Machine Learning Research Model License Agreement. See LICENSES/APPLE-MODEL-LICENSE.txt. Raw capture and dual workers are changes to the extension, not model weights.

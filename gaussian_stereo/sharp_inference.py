@@ -78,7 +78,7 @@ class _ReconstructionProfile:
         return result
 
 
-def _predict_image_cached(patcher, image_np, f_px, device, extrinsics=None, intrinsics=None, *, quiet=False, cache_features=True, profile=None):
+def _predict_image_cached(patcher, image_np, f_px, device, extrinsics=None, intrinsics=None, *, quiet=False, cache_features=True, profile=None, parity_config=None):
     import comfy.model_management
 
     report = log.debug if quiet else log.info
@@ -133,6 +133,16 @@ def _predict_image_cached(patcher, image_np, f_px, device, extrinsics=None, intr
         profile.mark("decode")
     report("SHARP decode completed in %.2fs", time.time() - started)
 
+    if parity_config is not None:
+        from .sharp_rtx_test import check_parity
+        check_parity(parity_config, image_np, f_px, gaussians_ndc)
+    return _unproject(gaussians_ndc, image_np, f_px, device, extrinsics, intrinsics,
+                      cache_features=cache_features, profile=profile)
+
+
+def _unproject(gaussians_ndc, image_np, f_px, device, extrinsics, intrinsics, *, cache_features, profile):
+    internal_shape = (1536, 1536)
+    height, width = image_np.shape[:2]
     if intrinsics is not None:
         unproj_intrinsics = intrinsics.clone()
     else:
@@ -167,8 +177,17 @@ def run_sharp_inference(model_config, image, output_dir, focal_length_mm=30.0,
         raise ValueError("SHARP VR Video Preview expects one IMAGE with shape [1,H,W,C].")
 
     started = time.perf_counter()
-    patcher = _load_sharp_model(model_config)
-    device = patcher.load_device
+    backend = model_config.get("inference_backend", "PyTorch") if video_batch else "PyTorch"
+    from .sharp_rtx_test import RTX, REFERENCE, release
+    if backend == RTX:
+        patcher = None
+        device = comfy.model_management.get_torch_device()
+    else:
+        release()
+        # Keep the existing model cache key independent of test-only settings.
+        patcher = _load_sharp_model({k: v for k, v in model_config.items()
+                                     if k not in ("inference_backend", "rtx_test_folder")})
+        device = patcher.load_device
     profile = _ReconstructionProfile(device) if video_batch and timings is not None else None
     source_rgb = image[0].detach().cpu().numpy()
     if video_batch:
@@ -211,11 +230,19 @@ def run_sharp_inference(model_config, image, output_dir, focal_length_mm=30.0,
 
     report = log.debug if quiet else log.info
     report("Running SHARP inference for %dx%d image", width, height)
-    gaussians = _predict_image_cached(
-        patcher, image_np, f_px, device,
-        extrinsics=img_extrinsics, intrinsics=img_intrinsics, quiet=quiet,
-        cache_features=not video_batch, profile=profile,
-    )
+    if backend == RTX:
+        from .sharp_rtx_test import predict
+        raw = predict(model_config, image_np, f_px, device, profile)
+        gaussians = _unproject(raw, image_np, f_px, device, img_extrinsics, img_intrinsics,
+                               cache_features=False, profile=profile)
+        del raw
+    else:
+        gaussians = _predict_image_cached(
+            patcher, image_np, f_px, device,
+            extrinsics=img_extrinsics, intrinsics=img_intrinsics, quiet=quiet,
+            cache_features=not video_batch, profile=profile,
+            parity_config=model_config if backend == REFERENCE else None,
+        )
 
     reconstructed = time.perf_counter()
     # Batch rendering requests an in-memory PLY; single-image previews retain file export.

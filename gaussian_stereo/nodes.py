@@ -232,6 +232,40 @@ STEREO_PRESETS = [
     "Cross-eyed / Freeview",
 ]
 PROJECTION_MODES = ["Parallel off-axis", "Parallel", "Toe-in", "Legacy / Parallel", "Legacy / Toe-in"]
+OUTPUT_RESOLUTION_OPTIONS = ["Source", "720p", "1080p", "1440p", "2160p (4K)", "Custom"]
+OUTPUT_HEIGHT_BY_LABEL = {
+    "720p": 720,
+    "1080p": 1080,
+    "1440p": 1440,
+    "2160p (4K)": 2160,
+}
+
+
+def resolve_output_eye_size(source_width, source_height, output_resolution, custom_output_height):
+    if output_resolution == "Source":
+        return int(source_width), int(source_height)
+    if output_resolution == "Custom":
+        target_height = int(custom_output_height)
+    else:
+        if output_resolution not in OUTPUT_HEIGHT_BY_LABEL:
+            raise ValueError(f"Unknown output resolution: {output_resolution}")
+        target_height = OUTPUT_HEIGHT_BY_LABEL[output_resolution]
+    if not 64 <= target_height <= 8192:
+        raise ValueError("Custom output height must be between 64 and 8192 pixels")
+    target_width = max(2, 2 * int(round(float(source_width) * target_height / source_height / 2)))
+    if target_width > 8192:
+        raise ValueError("Output eye width exceeds 8192 pixels; choose a smaller height")
+    return target_width, int(target_height)
+
+
+def scale_render_intrinsics(intr, width, height, output_width, output_height):
+    if (width, height) == (output_width, output_height):
+        return intr
+    if intr is None:
+        raise ValueError("Output resolution override requires SHARP camera intrinsics")
+    sx, sy = output_width / width, output_height / height
+    return [[intr[0][0] * sx, intr[0][1] * sx, output_width / 2],
+            [intr[1][0] * sy, intr[1][1] * sy, output_height / 2], list(intr[2])]
 
 
 def resolve_stereo_settings(projection_mode, baseline_mm, convergence_m,
@@ -344,6 +378,12 @@ class SharpVRVideoBatch(GaussianStereoPreview):
                 "fallback_fps": ("FLOAT", {"default":24.0,"min":0.001,"max":240.0,"step":0.001,"round":0.001,
                     "tooltip": "Used when video_info is absent or has no valid loaded FPS."}),
                 "meta_batch": ("VHS_BatchManager", {"tooltip": "Optional: same VHS Meta Batch Manager as loader and combiner; keeps animation continuous and supplies full audio on final chunk."}),
+                "output_resolution": ("COMBO", {"options": OUTPUT_RESOLUTION_OPTIONS, "default": "Source",
+                    "tooltip": "Per-eye render resolution. Final stereo output is side-by-side, so total width is doubled."}),
+                "custom_output_height": ("INT", {"default": 2160, "min": 64, "max": 8192, "step": 2,
+                    "tooltip": "Used only when output_resolution is Custom. Aspect ratio is preserved automatically."}),
+                "render_workers": ("COMBO", {"options": ["2 (default)", "1 (compatibility)"], "default": "2 (default)",
+                    "tooltip": "Two permits two simultaneous stereo frame jobs with automatic embedded workers; inference stays single-frame. More GPU/RAM usage. Use 1 for compatibility."}),
             },
             "hidden": {"unique_id": "UNIQUE_ID", "prompt": "PROMPT"}}
     RETURN_TYPES = ("IMAGE", "AUDIO", "FLOAT")
@@ -351,6 +391,12 @@ class SharpVRVideoBatch(GaussianStereoPreview):
     RETURN_NAMES = ("stereo_frames", "audio", "fps")
     FUNCTION = "run_batch"
     CATEGORY = "utils/preview"
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, render_workers="2 (default)"):
+        if render_workers in ("1", "2", "1 (baseline)", "2 (experimental)", "1 (compatibility)", "2 (default)"):
+            return True
+        return f"Unknown render_workers: {render_workers}"
 
     @classmethod
     def IS_CHANGED(cls, **kwargs): return float("nan")
@@ -365,7 +411,8 @@ class SharpVRVideoBatch(GaussianStereoPreview):
                   camera_dolly_mode="Fixed", camera_dolly_pattern=DEFAULT_CAMERA_PATTERN,
                   camera_orbit_yaw_mode="Fixed", camera_orbit_yaw_pattern=DEFAULT_CAMERA_PATTERN,
                   camera_orbit_pitch_mode="Fixed", camera_orbit_pitch_pattern=DEFAULT_CAMERA_PATTERN,
-                  video_info=None, audio=None, fallback_fps=24.0, prompt=None, meta_batch=None):
+                  video_info=None, audio=None, fallback_fps=24.0, prompt=None, meta_batch=None,
+                  output_resolution="Source", custom_output_height=2160, render_workers="2 (default)"):
         import io
         import time
         import numpy as np
@@ -375,7 +422,8 @@ class SharpVRVideoBatch(GaussianStereoPreview):
         from PIL import Image
         from tqdm import tqdm
         from .sharp_inference import video_inference_frames, clear_video_batch_cache
-        from .batch_bridge import submit_capture, finish_capture, cancel_capture, packed_browser_available
+        from .batch_bridge import submit_capture, finish_capture, cancel_capture, packed_browser_available, RAW_LIMIT_BYTES
+        from collections import deque
         import os
 
         if getattr(image, "ndim", None) != 4 or image.shape[0] < 1 or image.shape[-1] != 3:
@@ -386,6 +434,9 @@ class SharpVRVideoBatch(GaussianStereoPreview):
                                          stereo_intensity, depth_scale, splat_size_scale,
                                          camera_dolly_m, camera_orbit_yaw_deg, camera_orbit_pitch_deg)
         count, height, width, _ = image.shape
+        output_width, output_height = resolve_output_eye_size(width, height, output_resolution, custom_output_height)
+        sbs_width = output_width * 2
+        output_gib = count * output_height * sbs_width * 3 * 4 / 2**30
         motion = {
             "dolly_m": camera_motion_keys(camera_dolly_mode, camera_dolly_pattern, DOLLY_MOTION_PATTERNS),
             "orbit_yaw_deg": camera_motion_keys(camera_orbit_yaw_mode, camera_orbit_yaw_pattern, ORBIT_MOTION_PATTERNS),
@@ -430,36 +481,60 @@ class SharpVRVideoBatch(GaussianStereoPreview):
         geometry_stages = dict(unproject_prepare=0.0, unproject_svd=0.0, unproject_post=0.0)
         geometry_samples = 0
         browser_stages = dict(load=0.0, ready=0.0, compose=0.0, pixels=0.0)
+        capture_detail = dict(draw=0.0, composite=0.0, claim_wait=0.0, server_receive=0.0, transfer_bytes=0.0)
+        capture_samples = dict.fromkeys(capture_detail, 0)
+        worker_counts = {}
+        active_peak = 0
+        concurrent_claims = 0
+        warm_totals = dict.fromkeys(totals, 0.0)
+        warm_count = 0
+        warm_started = None
         load_samples = 0
         load_fetch = load_parse = load_total = fast_count = direct_count = shared_count = packed_count = 0.0
         browser_samples = 0
         raw_frames = 0
         progress = ProgressBar(count)
-        # One browser job in flight; reconstruction stays on ComfyUI's execution
-        # thread. Opt out for low-VRAM systems or serial A/B benchmarking.
+        logging.getLogger(__name__).info(
+            "[SHARP VR Video] Render target: source eye=%dx%d -> output eye=%dx%d, stereo frame=%dx%d, frames=%d",
+            width, height, output_width, output_height, sbs_width, output_height, count)
+        if self.VALIDATE_INPUTS(render_workers) is not True:
+            raise ValueError(f"Unknown render_workers setting: {render_workers}")
         overlap = os.environ.get("SHARP_VR_SERIAL", "0") != "1"
-        pending = None
+        capacity = 2 if overlap and render_workers in ("2", "2 (experimental)", "2 (default)") else 1
+        logging.getLogger(__name__).info("[SHARP VR Video] Capture: output tensor %.2f GiB, RGBA %.2f MiB/frame; raw limit %d MiB; max %d render job(s) in flight", output_gib, sbs_width * output_height * 4 / 2**20, RAW_LIMIT_BYTES // 2**20, capacity)
+        if output_gib > 4:
+            logging.getLogger(__name__).warning("[SHARP VR Video] Large output batch; consider reducing VHS frames_per_batch to 16 or 32")
+        pending = deque()
         batch_started = time.perf_counter()
         wait_total = 0.0
 
         def collect(ticket, i):
-            nonlocal out, raw_frames, browser_samples, load_samples
+            nonlocal out, raw_frames, browser_samples, load_samples, warm_started, warm_count, active_peak, concurrent_claims
             nonlocal load_fetch, load_parse, load_total, fast_count, direct_count, shared_count, packed_count, wait_total
             browser_timings = {}
             waiting = time.perf_counter()
             captured = finish_capture(ticket, browser_timings)
             decoded_started = time.perf_counter()
             wait_total += decoded_started - waiting
+            for key in capture_detail:
+                if key in browser_timings:
+                    capture_detail[key] += browser_timings[key]
+                    capture_samples[key] += 1
+            worker = browser_timings.get("worker", "unknown")
+            worker_counts[worker] = worker_counts.get(worker, 0) + 1
+            simultaneous = browser_timings.get("active_at_claim", 1)
+            active_peak = max(active_peak, simultaneous)
+            concurrent_claims += int(simultaneous > 1)
             if isinstance(captured, tuple):
                 raw, w, h = captured
-                if (w, h) != (2 * width, height):
-                    raise ValueError(f"Unexpected RGBA size: {w}x{h}")
+                if (w, h) != (sbs_width, output_height):
+                    raise ValueError(f"Unexpected RGBA size: {w}x{h}; expected {sbs_width}x{output_height}")
                 arr = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 4)[..., :3]
                 raw_frames += 1
             else:
                 with Image.open(io.BytesIO(captured)) as im:
-                    if im.size != (2 * width, height):
-                        raise ValueError(f"Expected SBS frame {2 * width}x{height}, got {im.size}")
+                    if im.size != (sbs_width, output_height):
+                        raise ValueError(f"Expected SBS frame {sbs_width}x{output_height}, got {im.size}")
                     arr = np.asarray(im.convert("RGB"), dtype=np.float32) / 255.0
             if all(key in browser_timings for key in browser_stages):
                 browser_samples += 1
@@ -475,7 +550,7 @@ class SharpVRVideoBatch(GaussianStereoPreview):
                 shared_count += browser_timings.get("shared", 0)
                 packed_count += browser_timings.get("packed", 0)
             if out is None:
-                out = torch.empty((count, height, 2 * width, 3), dtype=torch.float32, device="cpu")
+                out = torch.empty((count, output_height, sbs_width, 3), dtype=torch.float32, device="cpu")
             if isinstance(captured, tuple):
                 # Convert directly into the final CPU IMAGE tensor; avoid a
                 # temporary RGB float array and an additional full-frame copy.
@@ -483,20 +558,32 @@ class SharpVRVideoBatch(GaussianStereoPreview):
             else:
                 out[i].copy_(torch.from_numpy(arr))
             totals["browser"] += browser_timings["roundtrip"]
-            totals["decode"] += time.perf_counter() - decoded_started
+            decode_elapsed = time.perf_counter() - decoded_started
+            totals["decode"] += decode_elapsed
+            if i >= 5:
+                warm_totals["browser"] += browser_timings["roundtrip"]
+                warm_totals["decode"] += decode_elapsed
+                warm_count += 1
+            if i == 4:
+                warm_started = time.perf_counter()
             progress.update(1)
             console_progress.update(1)
 
         from .display_awake import display_awake
+        render_succeeded = False
         with display_awake(), tqdm(total=count, desc="SHARP stereo", unit="frame",
                   dynamic_ncols=True, mininterval=0.1) as console_progress:
             try:
                 packed_video = (stereo.get('depth_scale') == 1 and stereo.get('splat_scale') == 1 and packed_browser_available())
-                frames = video_inference_frames(model, image, focal_length_mm, packed_video=packed_video)
+                from .sharp_rtx_test import resolve_batch_backend
+                batch_model = resolve_batch_backend(model, meta_batch, unique_id, offset, timeline_valid)
+                frames = video_inference_frames(batch_model, image, focal_length_mm, packed_video=packed_video)
                 for i, (ply, ext, intr, timings) in enumerate(frames):
                     comfy.model_management.throw_exception_if_processing_interrupted()
                     for key in ("reconstruct", "export"):
                         totals[key] += timings[key]
+                        if i >= 5:
+                            warm_totals[key] += timings[key]
                     if all(key in timings for key in reconstruction_stages):
                         reconstruction_samples += 1
                         for key in reconstruction_stages:
@@ -508,68 +595,80 @@ class SharpVRVideoBatch(GaussianStereoPreview):
                     try:
                         ext_data = self._validate_matrix(ext, "extrinsics", 4, 4)
                         intr_data = self._validate_matrix(intr, "intrinsics", 3, 3)
+                        intr_data = scale_render_intrinsics(intr_data, width, height, output_width, output_height)
                         frame_stereo = stereo.copy() if animated else stereo
                         for key, keys in animated.items():
                             frame_stereo[key] = camera_motion_value(stereo[key], keys, offset + i, timeline_count)
-                        # Consume the preceding frame before dispatching another.
-                        # The image index and its camera parameters never change.
-                        if pending is not None:
-                            collect(pending, i - 1)
-                            pending = None
+                        # Bound in-flight jobs; each ticket retains its own frame index
+                        # and camera. Collect FIFO even if workers finish out of order.
+                        if len(pending) >= capacity:
+                            old_index, old_ticket = pending.popleft()
+                            collect(old_ticket, old_index)
                         comfy.model_management.throw_exception_if_processing_interrupted()
-                        pending = submit_capture(ply, ext_data, intr_data, node_id=unique_id,
+                        ticket = submit_capture(ply, ext_data, intr_data, node_id=unique_id,
                                                  timeout=int(frame_timeout_seconds), stereo=frame_stereo,
-                                                 expected_size=(2 * width, height))
+                                                 expected_size=(sbs_width, output_height), parallel_workers=capacity)
+                        pending.append((i, ticket))
                     finally:
                         del ply
                     if not overlap:
-                        collect(pending, i)
-                        pending = None
-                if pending is not None:
-                    collect(pending, count - 1)
-                    pending = None
+                        old_index, old_ticket = pending.popleft()
+                        collect(old_ticket, old_index)
+                while pending:
+                    old_index, old_ticket = pending.popleft()
+                    collect(old_ticket, old_index)
+                render_succeeded = True
             finally:
-                if pending is not None:
-                    cancel_capture(pending)
+                while pending:
+                    _, old_ticket = pending.popleft()
+                    cancel_capture(old_ticket)
                 if 'frames' in locals():
                     frames.close()
                 try:
+                    from .sharp_rtx_test import finish_batch_backend
+                    finish_batch_backend(meta_batch, unique_id, final or not timeline_valid or not render_succeeded)
                     clear_video_batch_cache()
                 except Exception:
                     logging.getLogger(__name__).warning("[SHARP VR Video] Chunk cache cleanup failed", exc_info=True)
         totals["total"] = time.perf_counter() - batch_started
         logging.getLogger(__name__).info(
             "[SHARP VR Video] Pipeline: %s; exposed browser wait=%.3f s/frame (stage times may overlap)",
-            "one-frame lookahead" if overlap else "serial", wait_total / count)
+            f"{capacity} render job(s) in flight" if overlap else "serial", wait_total / count)
         logging.getLogger(__name__).info(
             "[SHARP VR Video] Performance (%d frames, mean seconds/frame): "
             "reconstruct=%.3f, export+cleanup=%.3f, browser=%.3f, pixels+tensor=%.3f, total=%.3f",
             count, *(totals[key] / count for key in ("reconstruct", "export", "browser", "decode", "total")))
         if reconstruction_samples:
-            logging.getLogger(__name__).debug(
+            logging.getLogger(__name__).info(
                 "[SHARP VR Video] Reconstruction detail (%d frames, mean stage seconds): "
                 "input+model=%.3f, encode=%.3f, decode=%.3f, unproject=%.3f",
                 reconstruction_samples,
                 *(reconstruction_stages[key] / reconstruction_samples for key in reconstruction_stages))
         if geometry_samples:
-            logging.getLogger(__name__).debug(
+            logging.getLogger(__name__).info(
                 "[SHARP VR Video] Geometry detail (%d frames, mean stage seconds): "
                 "prepare=%.3f, solve=%.3f, post=%.3f",
                 geometry_samples, *(geometry_stages[key] / geometry_samples for key in geometry_stages))
         if browser_samples:
-            logging.getLogger(__name__).debug(
+            logging.getLogger(__name__).info(
                 "[SHARP VR Video] Browser detail (%d profiled frames, raw RGBA=%d/%d, mean seconds/frame): "
                 "load=%.3f, ready=%.3f, compose=%.3f, pixels=%.3f",
                 browser_samples, raw_frames, count,
                 *(browser_stages[key] / browser_samples for key in browser_stages))
         if load_samples:
-            logging.getLogger(__name__).debug(
+            logging.getLogger(__name__).info(
                 "[SHARP VR Video] Splat load detail (fast parser=%d/%d, mean seconds/frame): fetch=%.3f, parse+construct=%.3f, setup=%.3f",
                 int(fast_count), load_samples, load_fetch / load_samples, load_parse / load_samples,
                 max(0.0, load_total - load_fetch - load_parse) / load_samples)
             logging.getLogger(__name__).info(
                 "[SHARP VR Video] Browser fast path: direct decoder=%d/%d, shared stereo packing=%d/%d, packed GPU export=%d/%d",
                 int(direct_count), load_samples, int(shared_count), load_samples, int(packed_count), load_samples)
+        logging.getLogger(__name__).info("[SHARP VR Video] Capture detail: %s; raw=%d, PNG=%d; workers=%s", ", ".join(f"{k}={capture_detail[k]/capture_samples[k]/(2**20 if k == 'transfer_bytes' else 1):.3f}{' MiB' if k == 'transfer_bytes' else 's'}" for k in capture_detail if capture_samples[k]), raw_frames, count-raw_frames, worker_counts)
+        logging.getLogger(__name__).info("[SHARP VR Video] Worker concurrency: requested=%d, distinct=%d, peak active claims=%d, overlapping claims=%d/%d", capacity, len(worker_counts), active_peak, concurrent_claims, count)
+        if capacity == 2 and (len(worker_counts) < 2 or active_peak < 2):
+            logging.getLogger(__name__).warning("[SHARP VR Video] Two-worker mode did not observe simultaneous claims; keep the ComfyUI page visible or use two dedicated renderer windows. Rendering can continue with one worker.")
+        if warm_count and warm_started is not None:
+            logging.getLogger(__name__).info("[SHARP VR Video] Warm detail (exclude first 5 frames; %d frames): reconstruct=%.3f, export=%.3f, browser=%.3f, pixels+tensor=%.3f, completion interval=%.3f s/frame", warm_count, *(warm_totals[k]/warm_count for k in ("reconstruct", "export", "browser", "decode")), (batch_started + totals["total"] - warm_started)/warm_count)
         output_audio, fps = resolve_video_audio(video_info, audio, prompt, unique_id, count, fallback_fps,
                                                 meta_batch, timeline_count if meta_batch is not None and timeline_valid else None)
         if meta_batch is not None:

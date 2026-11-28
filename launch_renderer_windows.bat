@@ -21,7 +21,7 @@ if not defined BROWSER (
   exit /b 1
 )
 set "PROFILE=%LOCALAPPDATA%\SHARP-VR-Video\RendererProfile\%KIND%"
-set "URL=%ORIGIN%/extensions/%EXTENSION_FOLDER%/viewer_gaussian.html?batch=1&worker=1&v=sharp-projection-29"
+set "URL=%ORIGIN%/extensions/%EXTENSION_FOLDER%/viewer_gaussian.html?batch=1&worker=1&v=sharp-release-030"
 echo Starting dedicated SHARP renderer in %KIND%. Keep the window open and visible.
 start "SHARP renderer" "%BROWSER%" --user-data-dir="%PROFILE%" --no-first-run --no-default-browser-check --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows --disable-features=CalculateNativeWinOcclusion --new-window "%URL%"
 endlocal

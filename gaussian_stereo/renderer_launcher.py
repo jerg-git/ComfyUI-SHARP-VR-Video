@@ -68,7 +68,7 @@ def _launch_browser(origin):
         raise RuntimeError("Windows LOCALAPPDATA is unavailable.")
     profile = Path(local) / "SHARP-VR-Video" / "RendererProfile" / kind
     folder = quote(Path(__file__).resolve().parents[1].name, safe="")
-    url = f"{origin}/extensions/{folder}/viewer_gaussian.html?batch=1&worker=1&v=sharp-projection-29"
+    url = f"{origin}/extensions/{folder}/viewer_gaussian.html?batch=1&worker=1&v=sharp-release-030"
     args = [str(browser), f"--user-data-dir={profile}", "--no-first-run", "--no-default-browser-check",
             "--disable-background-timer-throttling", "--disable-renderer-backgrounding",
             "--disable-backgrounding-occluded-windows", "--disable-features=CalculateNativeWinOcclusion",

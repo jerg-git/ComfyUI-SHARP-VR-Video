@@ -1,3 +1,31 @@
+# SHARP VR Video v0.3.0 — Faster high-resolution stereo video
+
+Major high-resolution rendering update, building on the v0.2.x performance improvements.
+
+## What's new
+
+- **Up to 4.8x faster 4K-per-eye rendering pipeline** in development benchmarks: lossless raw RGBA transfer replaces the expensive PNG path for frames up to 128 MiB. No global HTTP upload limit changes.
+- **Dual render workers**: `2 (default)` overlaps stereo frame jobs while keeping neural inference sequential and output frame order intact. A second embedded browser worker starts on demand. `1 (compatibility)` remains available; the existing dedicated renderer launchers are optional.
+- **Per-eye render resolution**: Source, 720p, 1080p, 1440p, 2160p (4K), or Custom. Preserves aspect ratio and camera framing; native Gaussian re-rendering, not an AI upscaler.
+- **Optional TensorRT for RTX (ONNX FP16)**: use a trusted, locally built engine on supported Windows NVIDIA RTX systems. Auto discovers an FP16-compatible local engine in `models/sharp/tensorrt` or a custom folder and falls back to PyTorch if initial engine setup fails. It never switches silently mid-video. Explicit TensorRT mode reports errors. Preview remains PyTorch.
+- Retains parallel-projection fixes, optional CuPy acceleration, camera animation, audio/FPS, VHS Meta Batch support and Queue Manager protection. Existing workflow and mandatory dependencies unchanged.
+
+## Development benchmark (RTX 5080)
+
+| Output per eye | Earlier v0.2.12 test, 1 worker | v0.2.14 test, 2 workers | Throughput improvement |
+|---|---:|---:|---:|
+| 1080p | 0.400 s/frame | 0.262 s/frame | 1.53x |
+| 1440p | 0.503 s/frame | 0.276 s/frame | 1.82x |
+| 4K (7680 x 2160 SBS) | 1.505 s/frame | 0.313 s/frame | 4.81x |
+
+Same 720p source clip, 64 frames, Meta Batch 32, warmed second batch, TensorRT FP16 and CuPy, dedicated renderer windows. At 4K, raw capture with one worker reached 0.489 s/frame before enabling the second worker. All 64 decoded RGB frame MD5 checksums, timestamps and durations matched exactly between the one- and two-worker 4K outputs. This verifies output equivalence for that clip/configuration, not general TensorRT-vs-PyTorch equivalence or all hardware. Times exclude startup, video input and final encoding; results vary. The new embedded-worker startup path is not the one used for these benchmark numbers.
+
+## Upgrade
+
+Update the extension, restart ComfyUI and hard-refresh (Ctrl+F5). Keep a ComfyUI browser page open. Two workers are the default for new nodes; select one if needed for compatibility. close any old dedicated windows first, as the server prefers dedicated workers when present. For 4K use smaller VHS Meta Batches (16–32 depending on RAM). No TensorRT installation is required; ordinary PyTorch workflows still work. Optional TensorRT setup instructions are in the README; extract the separate kit into `ComfyUI/models/sharp/tensorrt` for automatic discovery. Apple's model license limits use to non-commercial scientific research and academic development.
+
+The consolidated build passed local bridge, ordering, cancellation, timeout, audio/timeline and mocked Auto-selection checks. Actual integrated embedded-WebGL startup, NVIDIA engine initialization and wider hardware compatibility require live testing. Silent clips can still trigger upstream VHS lazy-audio cache warnings.
+
 # v0.2.10 — Parallel stereo rendering fix and renderer launcher
 
 - Added a **Launch optimized renderer (Windows)** button on the batch node to open the optional isolated browser renderer without leaving the workflow. Direct local Windows connections only; manual BAT and ordinary dedicated renderer options remain available.

@@ -15,18 +15,19 @@ const EXTENSION_FOLDER = (() => {
 
 console.log("[Gaussian Stereo] Loading extension...");
 
-const workerUrl = `/extensions/${EXTENSION_FOLDER}/viewer_gaussian.html?batch=1&worker=1&v=sharp-projection-29`;
-function startSharedRenderer() {
+const workerUrl = `/extensions/${EXTENSION_FOLDER}/viewer_gaussian.html?batch=1&worker=1&v=sharp-release-030`;
+function startSharedRenderer(secondary = false) {
     // This belongs to the document, not to a graph or a DOM widget.
-    if (document.getElementById('sharp-vr-video-shared-renderer')) return;
+    const id = secondary ? 'sharp-vr-video-shared-renderer-2' : 'sharp-vr-video-shared-renderer';
+    if (document.getElementById(id)) return;
     const worker = document.createElement('iframe');
-    worker.id = 'sharp-vr-video-shared-renderer';
+    worker.id = id;
     worker.title = 'SHARP shared batch renderer';
     worker.setAttribute('aria-hidden', 'true');
     worker.tabIndex = -1;
     // Give the viewer a real layout size. Do not use display:none or detach it.
     worker.style.cssText = 'position:fixed;left:0;top:0;width:768px;height:420px;border:0;opacity:0;pointer-events:none;z-index:-1;';
-    worker.src = workerUrl;
+    worker.src = workerUrl + (secondary ? '&secondary=1' : '');
     document.body.appendChild(worker);
 }
 
@@ -34,9 +35,34 @@ function startSharedRenderer() {
 app.registerExtension({
     name: "comfyui.sharpvrvideo",
 
-    async setup() { startSharedRenderer(); },
+    async setup() {
+        window.addEventListener('message', (event) => {
+            const primary = document.getElementById('sharp-vr-video-shared-renderer');
+            if (event.origin === location.origin && event.source === primary?.contentWindow && event.data?.type === 'SHARP_REQUEST_SECOND_WORKER') {
+                startSharedRenderer(true);
+            }
+        });
+        startSharedRenderer();
+    },
 
     async beforeRegisterNodeDef(nodeType, nodeData, app) {
+        // Migrate historical saved widget labels without adding redundant options.
+        const migrations = nodeData.name === "SharpVRVideoLoadModel" ? {
+            inference_backend: {"PyTorch (parity reference)": "PyTorch", "TensorRT RTX (experimental)": "TensorRT for RTX (ONNX FP16)"}
+        } : nodeData.name === "SharpVRVideoBatch" ? {
+            render_workers: {"1": "1 (compatibility)", "1 (baseline)": "1 (compatibility)", "2": "2 (default)", "2 (experimental)": "2 (default)"}
+        } : null;
+        if (migrations) {
+            const previousConfigure = nodeType.prototype.onConfigure;
+            nodeType.prototype.onConfigure = function() {
+                const result = previousConfigure?.apply(this, arguments);
+                for (const [name, aliases] of Object.entries(migrations)) {
+                    const widget = this.widgets?.find(w => w.name === name);
+                    if (widget && Object.hasOwn(aliases, widget.value)) widget.value = aliases[widget.value];
+                }
+                return result;
+            };
+        }
         if (
             nodeData.name === "SharpVRVideoPreview"
         ) {
@@ -334,6 +360,15 @@ app.registerExtension({
                         if (pattern.options) pattern.options.hidden = hidden;
                         pattern.syncLiveVisibilityOptions?.();
                     }
+                    const resolution = findWidget("output_resolution");
+                    const custom = findWidget("custom_output_height");
+                    if (resolution && custom) {
+                        const connected = resolution.type?.startsWith("converted-widget") || this.inputs?.some(input => input.name === resolution.name && input.link != null);
+                        const customConnected = custom.type?.startsWith("converted-widget") || this.inputs?.some(input => input.name === custom.name && input.link != null);
+                        custom.hidden = !connected && !customConnected && resolution.value !== "Custom";
+                        if (custom.options) custom.options.hidden = custom.hidden;
+                        custom.syncLiveVisibilityOptions?.();
+                    }
                     const height = this.computeSize?.()[1];
                     if (Number.isFinite(height) && this.size && height > this.size[1]) {
                         this.setSize([this.size[0], height]);
@@ -358,6 +393,15 @@ app.registerExtension({
                         };
                     }
                     if (pattern) pattern.label = label + ' pattern';
+                }
+                const resolution = findWidget("output_resolution");
+                if (resolution) {
+                    const callback = resolution.callback;
+                    resolution.callback = (value, ...args) => {
+                        const result = callback?.call(resolution, value, ...args);
+                        this.refreshSharpMotionWidgets();
+                        return result;
+                    };
                 }
                 const oldConnectionsChange = this.onConnectionsChange;
                 this.onConnectionsChange = (...args) => {

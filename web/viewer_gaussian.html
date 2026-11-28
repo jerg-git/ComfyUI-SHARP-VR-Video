@@ -206,7 +206,7 @@
     </div>
 
     <!-- Load bundled gsplat.js -->
-    <script src="./js/gsplat-bundle.js?v=sharp-projection-29"></script>
+    <script src="./js/gsplat-bundle.js?v=sharp-resolution-212"></script>
 
     <script type="module">
         // Use the globally exported GSPLAT
@@ -1811,10 +1811,11 @@
                 // Draw with the now-current focal uniforms and sorted indices.
                 const tCompose = performance.now();
                 renderStereoNow();
+                const tDraw = performance.now();
                 const finalCanvas = composeStereoCanvas();
                 const tPixels = performance.now();
                 const timings = {...loadDetail, load:(tReady-tLoad)/1000, ready:(tCompose-tReady)/1000,
-                                 compose:(tPixels-tCompose)/1000, pixels:0};
+                                 compose:(tPixels-tCompose)/1000, draw:(tDraw-tCompose)/1000, composite:(tPixels-tDraw)/1000, pixels:0};
                 if (isSharedWorker) {
                     // The same composited canvas as the legacy PNG path; keep it
                     // available for fallback without reconstructing or rerendering.
@@ -1846,16 +1847,21 @@
             const setStatus = (text) => { status.textContent = 'SHARP renderer: ' + text; document.title = 'SHARP renderer - ' + text; };
             setStatus('Ready / waiting for frames');
             let stopped = false;
+            const secondary = new URLSearchParams(location.search).get('secondary') === '1';
+            const workerId = globalThis.crypto?.randomUUID?.() || Math.random().toString(36).slice(2);
             window.addEventListener('pagehide', () => { stopped = true; });
             window.addEventListener('pageshow', (event) => { if (event.persisted && stopped) { stopped = false; poll(); } });
             async function poll() {
                 if (stopped) return;
                 try {
-                    const endpoint = '/sharp_vr_video_batch/next?worker=1&wait=1' + (SPLAT.PLYLoader.SupportsSharpPacked ? '&packed=1' : '') + (window.parent === window ? '&dedicated=1' : '');
+                    const endpoint = '/sharp_vr_video_batch/next?worker=1&wait=1&wid=' + encodeURIComponent(workerId) + (SPLAT.PLYLoader.SupportsSharpPacked ? '&packed=1' : '') + (window.parent === window ? '&dedicated=1' : '') + (secondary ? '&secondary=1' : '');
                     const response = await fetch(endpoint, {cache:'no-store'});
                     if (!response.ok) throw new Error('Polling HTTP ' + response.status);
                     const {job} = await response.json();
                     if (job) {
+                        if (!secondary && window.parent !== window && job.parallel_workers > 1) {
+                            window.parent.postMessage({type:'SHARP_REQUEST_SECOND_WORKER'}, location.origin);
+                        }
                         setStatus('Rendering frame');
                         let output, done;
                         try {

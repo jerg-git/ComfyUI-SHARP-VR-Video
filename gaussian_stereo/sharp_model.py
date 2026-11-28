@@ -231,6 +231,11 @@ class SharpVRVideoLoadModel:
                     "default": "fp16",
                     "tooltip": "FP16 is the default. You can also select auto, BF16, or FP32.",
                 }),
+            },
+            "optional": {
+                "inference_backend": ("COMBO", {"options": ["Auto", "PyTorch", "TensorRT for RTX (ONNX FP16)"],
+                    "default": "Auto", "tooltip": "Auto uses a compatible prebuilt local RTX engine in FP16, otherwise PyTorch. Explicit RTX is strict. Preview always uses PyTorch."}),
+                "rtx_test_folder": ("STRING", {"default": "", "tooltip": "Optional trusted local TensorRT setup folder containing engine and isolated_python. Blank discovers models/sharp/tensorrt; Auto uses PyTorch if no engine is present. No automatic installs."}),
             }
         }
 
@@ -239,9 +244,31 @@ class SharpVRVideoLoadModel:
     FUNCTION = "load_model"
     CATEGORY = "SHARP"
 
-    def load_model(self, precision="fp16"):
+    @classmethod
+    def VALIDATE_INPUTS(cls, inference_backend="PyTorch"):
+        # Accept historical API prompts without advertising legacy choices.
+        if inference_backend in ("Auto", "PyTorch", "TensorRT for RTX (ONNX FP16)",
+                                 "PyTorch (parity reference)", "TensorRT RTX (experimental)"):
+            return True
+        return f"Unknown inference_backend: {inference_backend}"
+
+    def load_model(self, precision="fp16", inference_backend="PyTorch", rtx_test_folder=""):
+        if inference_backend == "PyTorch (parity reference)":
+            inference_backend = "PyTorch"
+        if inference_backend == "TensorRT for RTX (ONNX FP16)":
+            inference_backend = "TensorRT RTX (experimental)"
         dtype_name = resolve_precision(precision)
         model_path = ensure_checkpoint()
         config = {"model_path": model_path, "precision": precision, "dtype": dtype_name}
+        if inference_backend != "PyTorch":
+            # A custom path wins; blank discovers the standard models directory.
+            # Resolve once in the loader so the chosen path remains clip-stable.
+            if not rtx_test_folder.strip():
+                from .sharp_rtx_test import ENGINE_NAME
+                standard = os.path.join(MODELS_DIR, "tensorrt")
+                if inference_backend != "Auto" or os.path.isfile(os.path.join(standard, ENGINE_NAME)):
+                    rtx_test_folder = standard
+            config.update(inference_backend=inference_backend, rtx_test_folder=rtx_test_folder)
+            _log(f"Requested batch backend: {'TensorRT for RTX (ONNX FP16)' if inference_backend == 'TensorRT RTX (experimental)' else inference_backend}")
         _log(f"Model config ready: precision={precision} -> {dtype_name}")
         return (config,)
